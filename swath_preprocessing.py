@@ -10,20 +10,19 @@ import os
 from tqdm import tqdm
 import fsspec
 import io
+import s3fs
+import subprocess
 
 # Satellite data access
 import earthaccess
 
-# Plotting and visualization
+# Optional plotting and visualization
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.mpl.gridliner
-
-import s3fs
-import subprocess
 
 
 def gather_filepaths(bbox, start, end, sensors):
