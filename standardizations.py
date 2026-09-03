@@ -1152,3 +1152,762 @@ def clean_swath_mapping(mapping_df, swath_gdf,
         print(f"    Grid cells: {report['initial_grid_cells']} → {report['final_grid_cells']}")
     
     return cleaned, report
+
+def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
+    """
+    CHECKED
+    
+    Aggregate pixel properties to grid cells.
+    
+    Metrics produced per grid cell:
+        BT bands (I4, I5, delta): count, min, max, mean, area-weighted mean
+        fire_mask: max, mode, area-weighted majority, fire pixel count
+        candidate_confidence: max, area-weighted majority, count
+        scan_angle: area-weighted mean
+        NaN coverage: fraction of total intersecting area from NaN pixels
+                      (computed separately per BT variable)
+        Saturation: fraction of total intersecting area from saturated pixels,
+                    plus grid cell coverage fraction from saturated pixels
+        Pixel counts and total intersecting area 
+    
+    All area-weighted metrics use pixel_intersection_area_km2 as weights,
+    representing the physical area of each pixel-grid cell intersection.
+    
+    NaN handling: NaN values are excluded from all aggregation metrics.
+    A separate nan_area_fraction variable is computed for each BT variable,
+    representing the fraction of the grid cell's total intersecting area
+    contributed by pixels with NaN values for that variable.
+    
+    Saturation handling: Saturated pixels have real BT values (e.g.,
+    I4 caps at 367K and sometimes experiences folding) and are included 
+    in all BT statistics. Two separate metrics track saturation:
+        - saturation_area_fraction: fraction of total intersecting area
+          from saturated pixels (bounded [0, 1])
+        - saturation_grid_coverage: fraction of the grid cell's physical
+          area covered by saturated pixel intersections (can exceed 1.0
+          when overlapping scans contribute multiple saturated pixels)
+    
+    Note: Bowtie pixels (fire_mask == 1) are expected to be removed
+    by clean_swath_mapping before this function is called.
+    
+    Parameters
+    ----------
+    mapping_df : pd.DataFrame
+        Cleaned mapping info from clean_swath_mapping.
+        Contains: timestamp, satellite, scan, pixel, grid_row, grid_col,
+                  grid_id, pixel_overlap_fraction, pixel_intersection_area_km2,
+                  grid_cell_overlap_fraction
+    swath_gdf : gpd.GeoDataFrame
+        Enriched pixel data with fire_mask, scan_angle, I4_bt, I5_bt, etc.
+    verbose : bool
+        Print progress
+    
+    Returns
+    -------
+    grid_agg_df : pd.DataFrame
+        One row per grid cell with aggregated properties
+    """
+    
+    if len(mapping_df) == 0:
+        if verbose:
+            print("Empty mapping_df - nothing to aggregate")
+        return pd.DataFrame()
+    
+    # ================================================================
+    # STEP 1: Merge pixel properties from swath_gdf with mapping_df
+    # ================================================================
+    
+    if verbose:
+        print(f"Aggregating {len(mapping_df)} pixel mappings to grid cells...")
+        print(f"  Timestamp: {mapping_df['timestamp'].unique()[0]}")
+        print(f"  Satellite: {mapping_df['satellite'].unique()[0]}")
+    
+    merge_cols = ['scan', 'pixel']
+    property_cols = ['I4_bt', 'I5_bt', 'delta_I4_I5', 'fire_mask', 
+                     'scan_angle', 'candidate_confidence', 'qa_saturation']
+    available_props = [c for c in property_cols if c in swath_gdf.columns]
+    
+    swath_properties = swath_gdf[merge_cols + available_props] # pull out subset of all needed cols
+
+    # merge with the mapping_df so each pixel~grid match also contains the relevant pixel properties 
+    mapping_full = mapping_df.merge(swath_properties, on=merge_cols, how='left')
+    
+    if verbose:
+        print(f"  Merged properties: {available_props}")
+    
+    grouped = mapping_full.groupby('grid_id', observed=True)
+
+    # Total area overlap of all pixels per grid cell
+    total_intersecting_areas = grouped['pixel_intersection_area_km2'].sum()
+        
+    # ================================================================
+    # STEP 2: BT band statistics — count, min, max, mean
+    # ================================================================
+    
+    if verbose:
+        print(f"  Computing BT band statistics...")
+    
+    bt_vars = ['I4_bt', 'I5_bt', 'delta_I4_I5']
+    bt_available = [v for v in bt_vars if v in mapping_full.columns] # defensive check that bt_vars are present
+    
+    bt_agg = {} 
+    for bt_var in bt_available: # define aggregation dict
+        bt_agg[bt_var] = ['count', 'min', 'max', 'mean']
+    
+    if len(bt_agg) == 0: # if the BT variables are missing, there's a problem - report it
+        raise ValueError(
+            f"No BT variables found in mapping_full. "
+            f"Expected at least one of {bt_vars}. "
+            f"Available columns: {list(mapping_full.columns)}"
+        )
+        
+    grid_agg_df = grouped.agg(bt_agg) # perform agg for each grid_id
+    grid_agg_df.columns = ['_'.join(col) for col in grid_agg_df.columns] # clean columns
+    grid_agg_df = grid_agg_df.reset_index()
+    
+    # ================================================================
+    # STEP 3: Area-weighted BT means + NaN coverage fractions
+    # ================================================================
+    
+    if verbose:
+        print(f"  Computing area-weighted BT means and NaN fractions...")
+    
+    for bt_var in bt_available: # loop through eact bt var again
+        
+        valid = mapping_full[bt_var].notna() # mask any nans for that bt var (i4, i5, delta)
+        
+        # --- Area-weighted mean (NaN-excluded) ---
+        valid_subset = mapping_full[valid] # apply mask
+        
+        # numerator - multiply each pixel's bt var by its intersection area (weight)
+        # then sum these values grouped by each grid_id
+        weighted_sum = valid_subset.assign(
+            _w=valid_subset[bt_var] * valid_subset['pixel_intersection_area_km2']
+        ).groupby('grid_id', observed=True)['_w'].sum()
+        
+        # denominator - sum all the weights present in a given grid cell
+        sum_of_intersecting_areas = valid_subset.groupby(
+            'grid_id', observed=True
+        )['pixel_intersection_area_km2'].sum()
+
+        # finish equation by computing the fraction
+        area_weighted_mean = (weighted_sum / sum_of_intersecting_areas).reset_index(
+            name=f'{bt_var}_area_weighted_mean'
+        )
+
+        # add to main df
+        grid_agg_df = grid_agg_df.merge(area_weighted_mean, on='grid_id', how='left')
+        
+        # --- NaN coverage fraction ---
+
+        # rationale for this: I4 fill values are originally -999; we replaced them with nan
+        # we want to capture if any non-valid BT measurements are present in a given grid cell
+        # note: these are separate from saturated or folded pixels - those still return a BT val
+        
+        # isolate nan pixels and compute their total overlap
+        nan_intersection_area = mapping_full[~valid].groupby( 
+            'grid_id', observed=True
+        )['pixel_intersection_area_km2'].sum()
+
+        # ask: "what fraction of the total contributing area comes from pixels with NaN values?"
+        nan_area_frac = (nan_intersection_area / total_intersecting_areas).reset_index(
+            name=f'{bt_var}_nan_area_fraction'
+        )
+
+        # merge back in
+        grid_agg_df = grid_agg_df.merge(nan_area_frac, on='grid_id', how='left')
+        
+        # for grid cells with no nan coverage, this defaults to 0
+        grid_agg_df[f'{bt_var}_nan_area_fraction'] = (
+            grid_agg_df[f'{bt_var}_nan_area_fraction'].fillna(0.0)
+        )
+    
+    if verbose:
+        for bt_var in bt_available:
+            col = f'{bt_var}_nan_area_fraction'
+            if col in grid_agg_df.columns:
+                n_any_nan = (grid_agg_df[col] > 0).sum()
+                max_nan = grid_agg_df[col].max()
+                print(f"    {bt_var}: {n_any_nan} cells with NaN "
+                      f"(max fraction: {max_nan:.3f})")
+    
+    # ================================================================
+    # STEP 3b: Saturation coverage fraction
+    # ================================================================
+    
+    if 'qa_saturation' in mapping_full.columns:
+        if verbose:
+            print(f"  Computing saturation coverage fractions...")
+        
+        saturated = mapping_full[mapping_full['qa_saturation'] == 1] # find any saturation pixels
+        
+        # same idea as above for nans - compute fraction of intersecting 
+        # area from saturated pixels 
+        if len(saturated) > 0:
+            sat_intersection_area = saturated.groupby(
+                'grid_id', observed=True
+            )['pixel_intersection_area_km2'].sum()
+            
+            sat_frac = (sat_intersection_area / total_intersecting_areas).reset_index(
+                name='saturation_area_fraction'
+            )
+            # merge it back
+            grid_agg_df = grid_agg_df.merge(sat_frac, on='grid_id', how='left')
+
+            # last saturated metric, which needs explanation: 
+            # calculate total saturated pixel area relative to that grid cell area
+            # 'grid_cell_overlap_fraction' is the pixel intersection area / grid cell area
+            # we sum these fractions across all saturated pixels to get the total fractional area overlap
+            # this is the same as if we waited to sum all the intersecting areas, and then divide once by the grid cell area
+            # example: (0.12km2 / 0.25km2) + (0.13km2 / 0.25km2) == (0.12km2 + 0.13km2) / 0.25km2
+            # individual intersection area ratios are pre-calculated (e.g., [0.12km2 / 0.25km2], [0.13km2 / 0.25km2]), 
+            # so we're just summing them below. 
+            
+            sat_grid_coverage = saturated.groupby('grid_id', observed=True)['grid_cell_overlap_fraction'].sum().reset_index(name='saturation_grid_coverage')
+            
+            # ^^^ NOTE: this value can (rarely) exceed 1.0 when overlapping scans contribute 
+            # multiple saturated pixels covering the same portion of the grid cell
+            
+            # merge back into grid
+            grid_agg_df = grid_agg_df.merge(sat_grid_coverage, on='grid_id', how='left')
+        
+        else:
+            grid_agg_df['saturation_area_fraction'] = 0.0
+            grid_agg_df['saturation_grid_coverage'] = 0.0
+        
+        grid_agg_df['saturation_area_fraction'] = grid_agg_df['saturation_area_fraction'].fillna(0.0)
+        grid_agg_df['saturation_grid_coverage'] = grid_agg_df['saturation_grid_coverage'].fillna(0.0)
+    
+        
+        if verbose:
+            n_any_sat = (grid_agg_df['saturation_area_fraction'] > 0).sum()
+            max_sat = grid_agg_df['saturation_area_fraction'].max()
+            print(f"    {n_any_sat} cells with saturation "
+                  f"(max area fraction: {max_sat:.3f})")
+            max_cov = grid_agg_df['saturation_grid_coverage'].max()
+            print(f"    Max grid coverage from saturation: {max_cov:.3f}")
+
+    # ================================================================
+    # STEP 4: Fire mask — max, mode, area-weighted majority
+    # ================================================================
+    
+    if 'fire_mask' not in mapping_full.columns:
+        raise ValueError(
+            f"'fire_mask' not found in mapping_full. "
+            f"This is required for fire detection metrics. "
+            f"Available columns: {list(mapping_full.columns)}"
+        )
+        
+    # Max fire mask per grid cell
+    fm_max = grouped['fire_mask'].max().reset_index(name='fire_mask_max')
+    grid_agg_df = grid_agg_df.merge(fm_max, on='grid_id', how='left')
+    
+    # --- Mode ---
+    # Count occurrences of each fire_mask value per grid cell,
+    # then pick the value with the highest count.
+    # sort_index ensures ties go to the lowest value
+    fm_counts = (
+        mapping_full
+        .groupby(['grid_id', 'fire_mask'], observed=True)
+        .size()
+        .reset_index(name='_count')
+    )
+    
+    # For each grid_id, keep the fire_mask with the highest count.
+    # for ties, the lower fire mask value is returned
+    fm_mode = (
+        fm_counts
+        .sort_values(['grid_id', '_count', 'fire_mask'], 
+                     ascending=[True, True, False]) # False leads to lower values winning ties
+        .drop_duplicates(subset='grid_id', keep='last')
+        .rename(columns={'fire_mask': 'fire_mask_mode'})
+    )
+    grid_agg_df = grid_agg_df.merge(fm_mode[['grid_id', 'fire_mask_mode']], on='grid_id', how='left')
+    
+    # --- Area-weighted majority ---
+    # Sum intersection area per (grid_id, fire_mask), then pick the
+    # fire_mask with the highest total area per grid_id.
+    fm_weights = (
+        mapping_full
+        .groupby(['grid_id', 'fire_mask'], observed=True)['pixel_intersection_area_km2']
+        .sum()
+        .reset_index(name='_weight')
+    )
+    
+    # Keep the fire_mask with highest weight per grid_id
+    fm_majority = (
+        fm_weights
+        .sort_values(['grid_id', '_weight'], ascending=[True, True])
+        .drop_duplicates(subset='grid_id', keep='last')
+        .rename(columns={'fire_mask': 'fire_mask_area_weighted_majority'})
+    )
+    grid_agg_df = grid_agg_df.merge(fm_majority[['grid_id', 'fire_mask_area_weighted_majority']], 
+                                    on='grid_id', how='left')
+    
+    # Fire pixel count (fire_mask >= 7)
+    fire_count = mapping_full[mapping_full['fire_mask'] >= 7].groupby(
+        'grid_id', observed=True
+    ).size().reset_index(name='n_fire_pixels')
+    grid_agg_df = grid_agg_df.merge(fire_count, on='grid_id', how='left')
+    grid_agg_df['n_fire_pixels'] = (
+        grid_agg_df['n_fire_pixels'].fillna(0).astype(int)
+    )
+    
+    # ================================================================
+    # STEP 4b: Candidate confidence — max, area-weighted majority
+    # ================================================================
+    
+    if 'candidate_confidence' in mapping_full.columns:
+        if verbose:
+            print(f"  Computing candidate confidence statistics...")
+        
+        candidates = mapping_full[
+            mapping_full['candidate_confidence'].notna()
+        ].copy()
+        
+        if len(candidates) > 0:
+            cand_grouped = candidates.groupby('grid_id', observed=True)
+            
+            # Max confidence per grid cell
+            cc_max = cand_grouped['candidate_confidence'].max().reset_index(
+                name='candidate_confidence_max'
+            )
+            grid_agg_df = grid_agg_df.merge(cc_max, on='grid_id', how='left')
+            
+            # --- Area-weighted majority ---
+            # Sum intersection area per (grid_id, candidate_confidence), then pick the
+            # candidate_confidence class with the highest total area per grid_id.
+            cc_weights = (
+                candidates
+                .groupby(['grid_id', 'candidate_confidence'], observed=True)
+                ['pixel_intersection_area_km2']
+                .sum()
+                .reset_index(name='_weight')
+            )
+            
+            cc_majority = (
+                cc_weights
+                .sort_values(['grid_id', '_weight'], ascending=[True, True])
+                .drop_duplicates(subset='grid_id', keep='last')
+                .rename(columns={
+                    'candidate_confidence': 'candidate_confidence_area_weighted_majority'
+                })
+            )
+            grid_agg_df = grid_agg_df.merge(
+                cc_majority[['grid_id', 'candidate_confidence_area_weighted_majority']], 
+                on='grid_id', how='left'
+            )
+            
+            # Count of candidate pixels per grid cell
+            cc_count = cand_grouped.size().reset_index(
+                name='n_candidate_pixels'
+            )
+            grid_agg_df = grid_agg_df.merge(
+                cc_count, on='grid_id', how='left'
+            )
+            
+        else:
+            grid_agg_df['candidate_confidence_max'] = np.nan
+            grid_agg_df['candidate_confidence_area_weighted_majority'] = np.nan
+            grid_agg_df['n_candidate_pixels'] = 0
+        
+        grid_agg_df['n_candidate_pixels'] = (
+            grid_agg_df['n_candidate_pixels'].fillna(0).astype(int)
+        )
+    
+    # ================================================================
+    # STEP 5: Area-weighted mean scan angle (NaN-safe)
+    # ================================================================
+    
+    if 'scan_angle' in mapping_full.columns:
+        if verbose:
+            print(f"  Computing area-weighted mean scan angle...")
+        
+        valid_sa = mapping_full['scan_angle'].notna()
+        valid_sa_subset = mapping_full[valid_sa]
+        
+        weighted_angle_sum = valid_sa_subset.assign(
+            _w=valid_sa_subset['scan_angle'] * valid_sa_subset['pixel_intersection_area_km2']
+        ).groupby('grid_id', observed=True)['_w'].sum()
+        
+        valid_sa_weight_sum = valid_sa_subset.groupby(
+            'grid_id', observed=True
+        )['pixel_intersection_area_km2'].sum()
+        
+        sa_weighted = (weighted_angle_sum / valid_sa_weight_sum).reset_index(
+            name='scan_angle_area_weighted_mean'
+        )
+        grid_agg_df = grid_agg_df.merge(sa_weighted, on='grid_id', how='left')
+    
+    # ================================================================
+    # STEP 6: Pixel counts, overlap totals, metadata
+    # ================================================================
+    
+    if verbose:
+        print(f"  Computing pixel counts and metadata...")
+    
+    n_pixels = grouped.size().reset_index(name='n_pixels')
+    grid_agg_df = grid_agg_df.merge(n_pixels, on='grid_id', how='left')
+    
+    total_intersecting_areas_df = total_intersecting_areas.reset_index(name='total_intersecting_area_km2')
+    grid_agg_df = grid_agg_df.merge(total_intersecting_areas_df, on='grid_id', how='left')
+    
+    metadata = grouped[['grid_row', 'grid_col', 'timestamp', 'satellite']].agg(
+        'first'
+    ).reset_index()
+    grid_agg_df = grid_agg_df.merge(metadata, on='grid_id', how='left')
+    
+    # ================================================================
+    # SUMMARY
+    # ================================================================
+    
+    if verbose:
+        print(f"\n  Aggregated to {len(grid_agg_df)} unique grid cells")
+        print(f"  Pixels per cell: mean={grid_agg_df['n_pixels'].mean():.1f}, "
+              f"max={grid_agg_df['n_pixels'].max()}")
+        
+        if 'n_fire_pixels' in grid_agg_df.columns:
+            n_fire_cells = (grid_agg_df['n_fire_pixels'] > 0).sum()
+            print(f"  Grid cells with fire (mask >= 7): {n_fire_cells}")
+        
+    return grid_agg_df
+
+def grid_agg_to_xarray(grid_agg_df, fire_extent, grid_meta, swath_ds, test=True, verbose=True):
+    """
+    Place aggregated grid results into a fixed-extent xarray Dataset
+    with a time dimension, ready for Zarr append.
+    
+    Parameters
+    ----------
+    grid_agg_df : pd.DataFrame
+        Output from aggregate_pixels_to_grid
+    fire_extent : dict
+        Fixed spatial extent from create_fire_grid_extent
+    grid_meta : dict
+        Grid metadata from create_reference_grid
+    swath_ds : xr.Dataset
+        Original swath dataset — used to extract per-timestep metadata
+    test : bool
+        Run placement verification tests. Default True.
+    verbose : bool
+        Print progress messages. Default True.
+    
+    Returns
+    -------
+    ds : xr.Dataset
+        Dataset with dims (time=1, y, x).
+        Per-timestep metadata stored as 1D variables along time.
+        CRS written via rioxarray.
+    """
+    
+    if len(grid_agg_df) == 0:
+        if verbose:
+            print("Empty grid_agg_df — nothing to convert")
+        return xr.Dataset()
+    
+    # ================================================================
+    # STEP 1: Unpack fixed extent
+    # ================================================================
+    
+    x_coords = fire_extent['x_coords']
+    y_coords = fire_extent['y_coords']
+    row_min = fire_extent['row_min']
+    col_min = fire_extent['col_min']
+    n_rows = fire_extent['n_rows']
+    n_cols = fire_extent['n_cols']
+    
+    # ================================================================
+    # STEP 2: Compute local indices and filter to extent
+    # ================================================================
+    
+    local_rows = grid_agg_df['grid_row'].values - row_min
+    local_cols = grid_agg_df['grid_col'].values - col_min
+    
+    # Drop any cells outside the fixed extent
+    in_bounds = (
+        (local_rows >= 0) & (local_rows < n_rows) &
+        (local_cols >= 0) & (local_cols < n_cols)
+    )
+    
+    n_oob = (~in_bounds).sum()
+    n_kept = in_bounds.sum()
+
+    if n_oob > 0 and verbose:
+        print(f"  WARNING: {n_oob} grid cells fell outside fire extent")
+    
+    if n_kept == 0 and verbose:
+        print(f"  WARNING: ALL grid cells fell outside fire extent!")
+    
+    local_rows = local_rows[in_bounds]
+    local_cols = local_cols[in_bounds]
+    grid_agg_valid = grid_agg_df[in_bounds].copy()
+    
+    # ================================================================
+    # STEP 3: Identify data variables to rasterize
+    # ================================================================
+    
+    skip_cols = {
+        'grid_id', 'grid_row', 'grid_col',
+        'timestamp', 'satellite'
+    }
+    data_var_names = [c for c in grid_agg_valid.columns if c not in skip_cols]
+    
+    # ================================================================
+    # STEP 4: Fill 2D arrays and expand to (time=1, y, x)
+    # ================================================================
+    
+    arrays = {}
+    for var in data_var_names:
+        values = grid_agg_valid[var].values
+        
+        # Choose fill value based on dtype
+        # -1 = "no data" for integers
+        # NaN = "no data" for floats
+        # 0 is reserved for "processed but no hits" (e.g., n_fire_pixels)
+        if np.issubdtype(values.dtype, np.integer):
+            arr = np.full((n_rows, n_cols), -1, dtype=np.float64)
+        else:
+            arr = np.full((n_rows, n_cols), np.nan, dtype=np.float64)
+        
+        arr[local_rows, local_cols] = values # assign values from that col
+        
+        # Expand: (y, x) → (1, y, x) for time stacking
+        arrays[var] = (['time', 'y', 'x'], arr[np.newaxis, :, :])
+
+    if test:
+        if verbose:
+            print("  [TEST] Verifying grid placement...")
+        
+        # Verify offset arithmetic
+        assert np.array_equal(local_rows + row_min, grid_agg_valid['grid_row'].values), \
+            "Row offset arithmetic mismatch"
+        assert np.array_equal(local_cols + col_min, grid_agg_valid['grid_col'].values), \
+            "Column offset arithmetic mismatch"
+        
+        # Verify a real data variable round-trips through the array correctly
+        test_var = data_var_names[0]
+        test_arr = arrays[test_var][1][0]  # unpack (['time','y','x'], arr[newaxis]) → (y, x)
+        recovered = test_arr[local_rows, local_cols]
+        expected = grid_agg_valid[test_var].values
+        
+        assert np.allclose(recovered, expected, equal_nan=True), \
+            f"Array placement verification failed for '{test_var}'"
+        
+        if verbose:
+            print(f"    Verified {len(local_rows)} cells using '{test_var}'")
+    
+    # ================================================================
+    # STEP 5: Extract per-timestep metadata from swath_ds
+    # ================================================================
+    
+    timestamp = pd.Timestamp(str(swath_ds['timestamp_str'].values))
+    satellite = str(swath_ds['satellite'].values)
+    daynight = str(swath_ds['daynight'].values)
+    overpass_period = str(swath_ds['overpass_period'].values)
+    avg_scan_angle = float(swath_ds['avg_scan_angle_scene'].values)
+    
+    # ================================================================
+    # STEP 6: Build Dataset
+    # ================================================================
+    
+    # Pad string variables to fixed width so Zarr dtype is consistent
+    # across all appends. Without this, "Day" (<U3) vs "Night" (<U5)
+    # causes a dtype mismatch on append.
+    max_sat_len = 10     # covers SNPP, NOAA20, NOAA21
+    max_dn_len = 5       # covers Day, Night, Both
+    max_period_len = 2   # AM, PM
+    
+    ds = xr.Dataset(
+        data_vars={
+            **arrays,
+            # Per-timestep metadata (1D along time, fixed-width strings)
+            'satellite': (['time'], np.array([satellite.ljust(max_sat_len)], dtype=f'U{max_sat_len}')),
+            'daynight': (['time'], np.array([daynight.ljust(max_dn_len)], dtype=f'U{max_dn_len}')),
+            'overpass_period': (['time'], np.array([overpass_period.ljust(max_period_len)], dtype=f'U{max_period_len}')),
+            'avg_scan_angle_scene': (['time'], [avg_scan_angle]),
+            'n_populated_cells': (['time'], [len(grid_agg_valid)]),
+        },
+        coords={
+            'time': [timestamp],
+            'y': y_coords,
+            'x': x_coords,
+            'lon': (['y', 'x'], fire_extent['lon']),
+            'lat': (['y', 'x'], fire_extent['lat']),
+        },
+    )
+    
+    # ================================================================
+    # STEP 7: Write CRS and transform via rioxarray
+    # ================================================================
+    
+    ds = ds.rio.write_crs(grid_meta['crs'])
+    ds = ds.rio.set_spatial_dims(x_dim='x', y_dim='y')
+    ds = ds.rio.write_transform(fire_extent['transform'])
+    
+    # ================================================================
+    # STEP 8: Fire-level attributes
+    # ================================================================
+    
+    ds.attrs = {
+        'reference_grid_id': f"EPSG:{grid_meta['crs_epsg']}_{grid_meta['resolution_m']}m",
+        'crs_epsg': grid_meta['crs_epsg'],
+        'pixel_size_x_m': grid_meta['resolution_m'],
+        'pixel_size_y_m': grid_meta['resolution_m'],
+        'reference_grid_row_offset': int(row_min),
+        'reference_grid_col_offset': int(col_min),
+        'n_populated_cells': int(len(grid_agg_valid)),
+        'n_total_cells': int(n_rows * n_cols),
+    }
+    
+    return ds
+
+def plot_gridded_swath(ds, swath_ds, grid_meta, save_path=None):
+    """
+    Plot original swath vs. gridded results.
+    
+    Layout (2x2):
+        Row 1: Original swath I4 BT | Gridded area-weighted mean I4 BT
+        Row 2: Gridded I4 BT max    | Gridded fire mask majority + candidates
+    
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Gridded output from grid_agg_to_xarray
+    swath_ds : xr.Dataset
+        Original swath dataset
+    grid_meta : dict
+        Reference grid metadata
+    save_path : str, optional
+        If provided, save figure to this path and close without displaying
+    """
+    
+    # Extract swath metadata
+    sat = str(swath_ds['satellite'].values)
+    timestamp = pd.Timestamp(str(swath_ds['timestamp_str'].values))
+    bbox = swath_ds.attrs.get('bbox', None)
+    
+    # Get swath data
+    lon = swath_ds['longitude'].values
+    lat = swath_ds['latitude'].values
+    i4_bt = swath_ds['I4_bt'].values
+    
+    # Shared BT colormap and range
+    cmap_bt = plt.cm.plasma.copy()
+    cmap_bt.set_bad(color='white', alpha=1)
+    vmin_bt, vmax_bt = 250, 360
+    
+    # Fire mask colormap (categorical)
+    mask_colors = [mpl.colormaps['tab10'](c) for c in [4, 6, 5, 0, 9, 2, 7, 8, 1, 3]]
+    cmap_fire = ListedColormap(mask_colors)
+    cmap_fire.set_bad(color='white', alpha=1)
+    
+    # Common extent
+    if bbox is not None:
+        plot_extent = [bbox[0], bbox[2], bbox[1], bbox[3]]
+        
+    fig = plt.figure(figsize=(20, 20))
+    gs = fig.add_gridspec(2, 2, hspace=0.10, wspace=0.05, top=0.93)
+    
+    # ---- ROW 1, LEFT: Original swath I4 BT ----
+    ax1 = fig.add_subplot(gs[0, 0], projection=ccrs.PlateCarree())
+    
+    plot_swath = ax1.pcolormesh(lon, lat, i4_bt,
+                                vmin=vmin_bt, vmax=vmax_bt,
+                                cmap=cmap_bt,
+                                transform=ccrs.PlateCarree())
+    
+    ax1.set_title(f"Original Swath — I4 BT (3.75 µm)\n"
+                  f"{sat} {timestamp.strftime('%Y-%m-%d %H:%M')} UTC\n",
+                  fontsize=12, fontweight='bold')
+    ax1.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+    if bbox is not None:
+        ax1.set_extent(plot_extent)
+    
+    # ---- ROW 1, RIGHT: Gridded I4 BT area-weighted mean ----
+    ax2 = fig.add_subplot(gs[0, 1], projection=ccrs.PlateCarree())
+    
+    ax2.pcolormesh(ds['lon'].values, ds['lat'].values,
+                   ds['I4_bt_area_weighted_mean'].values,
+                   vmin=vmin_bt, vmax=vmax_bt,
+                   cmap=cmap_bt,
+                   transform=ccrs.PlateCarree())
+    
+    ax2.set_title(f"Gridded — I4 BT Area-Weighted Mean\n"
+                  f"{grid_meta['resolution_m']}m reference grid\n",
+                  fontsize=12, fontweight='bold')
+    ax2.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+    if bbox is not None:
+        ax2.set_extent(plot_extent)
+    
+    cbar_bt1 = fig.colorbar(plot_swath, ax=[ax1, ax2], orientation='horizontal',
+                             pad=0.06, aspect=40, shrink=0.7)
+    cbar_bt1.set_label('Brightness Temperature (K)', fontsize=12)
+    
+    # ---- ROW 2, LEFT: Gridded I4 BT max ----
+    ax3 = fig.add_subplot(gs[1, 0], projection=ccrs.PlateCarree())
+    
+    plot_grid_max = ax3.pcolormesh(ds['lon'].values, ds['lat'].values,
+                                    ds['I4_bt_max'].values,
+                                    vmin=vmin_bt, vmax=vmax_bt,
+                                    cmap=cmap_bt,
+                                    transform=ccrs.PlateCarree())
+    
+    ax3.set_title(f"Gridded — I4 BT Max\n"
+                  f"Highest BT per grid cell\n",
+                  fontsize=12, fontweight='bold')
+    ax3.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+    if bbox is not None:
+        ax3.set_extent(plot_extent)
+    
+    cbar_bt2 = fig.colorbar(plot_grid_max, ax=ax3, orientation='horizontal',
+                             pad=0.06, aspect=30)
+    cbar_bt2.set_label('Max Brightness Temperature (K)', fontsize=11)
+    
+    # ---- ROW 2, RIGHT: Fire mask majority + candidate overlay ----
+    ax4 = fig.add_subplot(gs[1, 1], projection=ccrs.PlateCarree())
+    
+    fire_mask_gridded = ds['fire_mask_area_weighted_majority'].values.copy()
+    fire_mask_gridded = np.where(fire_mask_gridded < 0, np.nan, fire_mask_gridded)
+    
+    plot_fire = ax4.pcolormesh(ds['lon'].values, ds['lat'].values,
+                                fire_mask_gridded,
+                                vmin=0, vmax=9,
+                                cmap=cmap_fire,
+                                transform=ccrs.PlateCarree())
+    
+    n_cand_cells = 0
+    if 'n_candidate_pixels' in ds:
+        cand_mask = ds['candidate_confidence_area_weighted_majority'].values == 0
+        if cand_mask.any():
+            cand_lons = ds['lon'].values[cand_mask]
+            cand_lats = ds['lat'].values[cand_mask]
+            n_cand_cells = int(cand_mask.sum())
+            
+            ax4.scatter(cand_lons, cand_lats,
+                       c='black', s=2, marker='.',
+                       transform=ccrs.PlateCarree(), zorder=10)
+    
+    ax4.set_title(f"Gridded — Fire Mask (Area-Weighted Majority)\n"
+                  f"Dominant class per cell | "
+                  f"Black dots = candidates ({n_cand_cells})\n",
+                  fontsize=12, fontweight='bold')
+    ax4.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
+    if bbox is not None:
+        ax4.set_extent(plot_extent)
+    
+    cbar_fire = fig.colorbar(plot_fire, ax=ax4, orientation='horizontal',
+                              pad=0.06, aspect=30)
+    cbar_fire.set_label('Fire Mask Category', fontsize=11)
+    fire_labels = ['0: Not\nproc.', '1: Bow-\ntie', '2: Not\nproc.',
+                   '3: Water', '4: Cloud', '5: Clear\nland',
+                   '6: Unclass.\nfire', '7: Low\nconf.', '8: Nom.\nconf.',
+                   '9: High\nconf.']
+    cbar_fire.ax.set_xticks(np.arange(10))
+    cbar_fire.ax.set_xticklabels(fire_labels, fontsize=7)
+    
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
