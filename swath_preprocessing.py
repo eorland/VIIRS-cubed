@@ -1188,8 +1188,13 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     spatial_test_failures = []
 
     all_timesteps = gather_filepaths(bbox, start, end, sensors)
+
+    if n_timesteps == -1:
+        timesteps_to_process = all_timesteps
+    else:
+        timesteps_to_process = all_timesteps[:n_timesteps]
+    
     # Create progress bar
-    timesteps_to_process = all_timesteps[:n_timesteps]
     pbar = tqdm(timesteps_to_process, desc="Processing swaths", unit="swath")
     
     for timestep_count, timestep_info in enumerate(pbar):
@@ -1368,6 +1373,145 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
 
     return
 
-# if __name__ == "__main__":
-    
+if __name__ == "__main__":
 
+    import argparse
+    import ast
+
+    parser = argparse.ArgumentParser(
+        description="Process VIIRS swath data for a given fire/region of interest."
+    )
+
+    # ===================================================================
+    # REQUIRED ARGUMENTS
+    # ===================================================================
+
+    parser.add_argument(
+        "--fire_name",
+        type=str,
+        required=True,
+        help="Name of the fire/region (used for output directory naming). E.g. 'Stanford_Flaring'"
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        required=True,
+        help="Start date for data query in YYYY-MM-DD format. E.g. '2026-05-10'"
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        required=True,
+        help="End date for data query in YYYY-MM-DD format. E.g. '2026-08-30'"
+    )
+    parser.add_argument(
+    "--bbox",
+    type=str,
+    required=True,
+    help="Bounding box as '[xmin, ymin, xmax, ymax]'. E.g. --bbox '[-112.25, 32.25, -111.25, 33.25]'"
+    )
+    parser.add_argument(
+    "--n_timesteps",
+    type=int,
+    default=-1,
+    help="Number of timesteps to process. Use -1 (default) to process all."
+    )
+
+    # ===================================================================
+    # OPTIONAL ARGUMENTS
+    # ===================================================================
+
+    parser.add_argument(
+        "--pix_lut_path",
+        type=str,
+        default=None,
+        help="Path to pixel size lookup table CSV. Defaults to S3 path if not provided."
+    )
+    parser.add_argument(
+    "--sensors",
+    type=str,
+    default='["SNPP", "NOAA20", "NOAA21"]',
+    help='Sensors to include as a list of strings. E.g. --sensors \'["SNPP", "NOAA20"]\''
+    )
+    parser.add_argument(
+        "--make_plots",
+        action="store_true",
+        default=False,
+        help="If set, generate and save overview plots for each swath."
+    )
+    parser.add_argument(
+        "--no_save_data",
+        action="store_true",
+        default=False,
+        help="If set, skip saving processed swaths as NetCDF files."
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="If set, reprocess and overwrite existing output files."
+    )
+    parser.add_argument(
+        "--no_spatial_test",
+        action="store_true",
+        default=False,
+        help="If set, skip spatial alignment verification test on each swath."
+    )
+    parser.add_argument(
+        "--copy_to_s3",
+        action="store_true",
+        default=False,
+        help="If set, copy outputs to S3 after processing."
+    )
+    parser.add_argument(
+        "--s3_prefix",
+        type=str,
+        default=None,
+        help="S3 destination prefix. Required if --copy_to_s3 is set. E.g. 's3://my-bucket/outputs/'"
+    )
+
+    args = parser.parse_args()
+
+    # ===================================================================
+    # VALIDATE ARGUMENT COMBINATIONS
+    # ===================================================================
+
+    if args.copy_to_s3 and args.s3_prefix is None:
+        parser.error("--s3_prefix is required when --copy_to_s3 is set.")
+
+    # ===================================================================
+    # CALL process_swaths
+    # ===================================================================
+
+    bbox = ast.literal_eval(args.bbox)
+    sensors = ast.literal_eval(args.sensors)
+    
+    process_swaths(
+        fire_name=args.fire_name,
+        start=args.start,
+        end=args.end,
+        bbox=bbox,
+        n_timesteps=args.n_timesteps,
+        pix_lut_path=args.pix_lut_path,
+        sensors=sensors,
+        make_plots=args.make_plots,
+        save_data=not args.no_save_data,
+        overwrite=args.overwrite,
+        run_spatial_test=not args.no_spatial_test,
+        copy_to_s3=args.copy_to_s3,
+        s3_prefix=args.s3_prefix
+    )
+    
+    # ===================================================================
+    # USAGE EXAMPLE
+    # ===================================================================    
+    #
+    # python swath_preprocessing.py \
+    #     --fire_name 'Dragon_Bravo_TEST' \
+    #     --start '2025-07-01' \
+    #     --end '2025-07-10' \
+    #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
+    #     --n_timesteps -1 \
+    #     --sensors '["SNPP", "NOAA20", "NOAA21"]' \
+    #     --copy_to_s3 \
+    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/'
