@@ -12,6 +12,7 @@ import fsspec
 import io
 import s3fs
 import subprocess
+import shutil
 
 # Satellite data access
 import earthaccess
@@ -1113,9 +1114,10 @@ def log_message(message, log_file, print_to_console=True, include_timestamp=True
         print(formatted_message)
 
 def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
-                   sensors=['SNPP', 'NOAA20', 'NOAA21'], make_plots=False, 
-                   save_data=True, overwrite=False, run_spatial_test=True, 
-                   copy_to_s3=False, s3_prefix=None):
+                   sensors=['SNPP', 'NOAA20', 'NOAA21'], make_plots=False,
+                   save_data=True, overwrite=False, run_spatial_test=True,
+                   copy_to_s3=False, s3_prefix=None,
+                   output_dir='VIIRS-cubed-outputs', remove_local=False):
 
     '''
     Main orchestration function which processes an arbitrary number
@@ -1125,12 +1127,14 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
 
     if copy_to_s3 and s3_prefix is None:
         raise ValueError("s3_prefix is required when copy_to_s3=True")
+    if remove_local and not copy_to_s3:
+        raise ValueError("remove_local=True requires copy_to_s3=True")
 
     # ===================================================================
     # CREATE ORGANIZED DIRECTORY STRUCTURE
     # ===================================================================
-    
-    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{fire_name}_Gridded_VIIRS")
+
+    base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
     plots_dir = os.path.join(base_output_dir, "Plots", "Step1_Compiled_Swaths")
     data_dir = os.path.join(base_output_dir, "Data", "Step1_Compiled_Swaths")
     logs_dir = os.path.join(base_output_dir, "Logs")
@@ -1309,7 +1313,7 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     pbar.close()
 
     if copy_to_s3:
-        s3_dest = os.path.join(s3_prefix, os.path.relpath(base_output_dir, os.path.expanduser("~"))).replace("\\", "/")
+        s3_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS"
         log_message(f"\n{'='*70}", log_file, include_timestamp=False)
         log_message(f"COPYING TO S3", log_file,)
         log_message(f"  Source:      {base_output_dir}/", log_file,)
@@ -1330,6 +1334,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
         if result.returncode == 0:
             log_message(f"S3 upload complete!", log_file,)
             log_message(f"  S3 location: {s3_dest}/", log_file,)
+            if remove_local:
+                shutil.rmtree(base_output_dir)
+                log_message(f"Local files removed: {base_output_dir}", log_file,)
         else:
             log_message(f"S3 upload failed!", log_file,)
             log_message(f"  Error: {result.stderr}", log_file,)
@@ -1471,6 +1478,18 @@ if __name__ == "__main__":
         default=None,
         help="S3 destination prefix. Required if --copy_to_s3 is set. E.g. 's3://my-bucket/outputs/'"
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default='VIIRS-cubed-outputs',
+        help="Local base directory for all outputs. Defaults to 'VIIRS-cubed-outputs'."
+    )
+    parser.add_argument(
+        "--remove_local",
+        action="store_true",
+        default=False,
+        help="If set, remove local output files after a successful S3 upload. Requires --copy_to_s3."
+    )
 
     args = parser.parse_args()
 
@@ -1480,6 +1499,8 @@ if __name__ == "__main__":
 
     if args.copy_to_s3 and args.s3_prefix is None:
         parser.error("--s3_prefix is required when --copy_to_s3 is set.")
+    if args.remove_local and not args.copy_to_s3:
+        parser.error("--remove_local requires --copy_to_s3.")
 
     # ===================================================================
     # CALL process_swaths
@@ -1501,7 +1522,9 @@ if __name__ == "__main__":
         overwrite=args.overwrite,
         run_spatial_test=not args.no_spatial_test,
         copy_to_s3=args.copy_to_s3,
-        s3_prefix=args.s3_prefix
+        s3_prefix=args.s3_prefix,
+        output_dir=args.output_dir,
+        remove_local=args.remove_local
     )
     
     # ===================================================================

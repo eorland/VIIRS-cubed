@@ -40,14 +40,14 @@ import cartopy.feature as cfeature
 import cartopy.mpl.gridliner
 
 
-def query_available_swath_data(fire_name):
+def query_available_swath_data(fire_name, output_dir='VIIRS-cubed-outputs'):
 
     # ===================================================================
     # LOCATE STEP 1 OUTPUT FILES
     # ===================================================================
-    
+
     # Define paths based on Step 1 naming convention
-    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{fire_name}_Gridded_VIIRS")
+    base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
     data_dir = os.path.join(base_output_dir, "Data", "Step1_Compiled_Swaths")
     
     # Check if directory exists
@@ -1942,18 +1942,21 @@ def get_zarr_encoding(ds, fire_extent):
     return encoding
 
 
-def standardize_swaths(fire_name, bbox, start, end, n_timesteps, 
-                       grid_region='conus',grid_resolution=375, 
-                       overwrite=False, make_plots=False, copy_to_s3=False, 
+def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
+                       grid_region='conus', grid_resolution=375,
+                       overwrite=False, make_plots=False, copy_to_s3=False,
                        s3_prefix=None, batch_size=50, grid_pad=10,
-                       remove_bowtie=False,deduplicate_scans=False):
+                       remove_bowtie=False, deduplicate_scans=False,
+                       output_dir='VIIRS-cubed-outputs', remove_local=False):
     
     '''Full workflow for loading and aggregating swath data into a regular grid.'''
     
     if copy_to_s3 and s3_prefix is None:
         raise ValueError("s3_prefix is required when copy_to_s3=True")
-    
-    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{fire_name}_Gridded_VIIRS")
+    if remove_local and not copy_to_s3:
+        raise ValueError("remove_local=True requires copy_to_s3=True")
+
+    base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
     step2_plots_dir = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
     logs_dir = os.path.join(base_output_dir, "Logs")
     mapping_output_dir = os.path.join(base_output_dir, "Data", "mappings")
@@ -1961,7 +1964,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     for directory in [step2_plots_dir, logs_dir, mapping_output_dir]:
         os.makedirs(directory, exist_ok=True)
     
-    swath_df = query_available_swath_data(fire_name)
+    swath_df = query_available_swath_data(fire_name, output_dir=output_dir)
     grid_meta = create_reference_grid(region=grid_region, resolution=grid_resolution)
     fire_extent, grid_gdf = create_fire_grid_extent(bbox, grid_meta, pad=grid_pad)
     
@@ -1973,7 +1976,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     # ZARR STORE SETUP
     # ===================================================================
     
-    local_zarr_path = f"/tmp/{fire_name}_datacube.zarr" # Local path for fast writes during processing
+    local_zarr_path = os.path.join(base_output_dir, "Data", f"{fire_name}_datacube.zarr")
     
     fs = None
     s3_zarr_path = None
@@ -2278,26 +2281,32 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                 local_ds.close()
                 
                 zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
-                
+
                 log_message(f"Appended to S3 ({time.time() - t0:.1f}s)",log_file)
+                if remove_local:
+                    shutil.rmtree(base_output_dir)
+                    log_message(f"Local files removed: {base_output_dir}",log_file)
             else:
                 # Fresh run — full copy
                 log_message("Copying Zarr store to S3...",log_file)
                 t0 = time.time()
-                
+
                 if fs.exists(s3_zarr_path):
                     fs.rm(s3_zarr_path, recursive=True)
-                
+
                 local_ds = xr.open_zarr(local_zarr_path)
                 store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                 encoding = get_zarr_encoding(local_ds, fire_extent)
                 local_ds.to_zarr(store, mode='w', encoding=encoding)
                 local_ds.close()
-                
+
                 zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
-                
+
                 log_message(f"Copied to {s3_zarr_path} ({time.time() - t0:.1f}s)",log_file)
-            
+                if remove_local:
+                    shutil.rmtree(base_output_dir)
+                    log_message(f"Local files removed: {base_output_dir}",log_file)
+
         else:
             log_message("No new data written — skipping S3 copy",log_file)
     
