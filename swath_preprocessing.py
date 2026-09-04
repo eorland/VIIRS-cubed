@@ -1123,6 +1123,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     
     '''
 
+    if copy_to_s3 and s3_prefix is None:
+        raise ValueError("s3_prefix is required when copy_to_s3=True")
+
     # ===================================================================
     # CREATE ORGANIZED DIRECTORY STRUCTURE
     # ===================================================================

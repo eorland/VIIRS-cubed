@@ -19,7 +19,14 @@ import os
 from tqdm import tqdm
 import pyproj
 from shapely.geometry import box, Polygon
+import zarr
 from zarr.codecs import BloscCodec
+import shutil
+import gc
+import fsspec
+
+# from preprocessing script
+from swath_preprocessing import log_message
 
 # Plotting and visualization
 import seaborn as sns
@@ -40,7 +47,7 @@ def query_available_swath_data(fire_name):
     # ===================================================================
     
     # Define paths based on Step 1 naming convention
-    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{NAME}_Gridded_VIIRS")
+    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{fire_name}_Gridded_VIIRS")
     data_dir = os.path.join(base_output_dir, "Data", "Step1_Compiled_Swaths")
     
     # Check if directory exists
@@ -136,7 +143,7 @@ def query_available_swath_data(fire_name):
         print(f"{'='*70}")
         bad_files_df = pd.DataFrame(bad_files)
         print(bad_files_df[['filename', 'error_type']])
-        print(f"\nYou may want to delete or re-process these files:")
+        print("\nYou may want to delete or re-process these files:")
         for bf in bad_files:
             print(f"  {bf['filepath']}")
 
@@ -1911,3 +1918,462 @@ def plot_gridded_swath(ds, swath_ds, grid_meta, save_path=None):
     else:
         plt.show()
 
+
+# ===================================================================
+# ZARR ENCODING (defined once, used for both initial write and flush)
+# ===================================================================
+
+def get_zarr_encoding(ds, fire_extent):
+    """Helper to build Zarr encoding dict for a batched dataset."""
+    compressor = BloscCodec(cname='zstd', clevel=3)
+    encoding = {}
+    for var in ds.data_vars:
+        if ds[var].dims == ('time', 'y', 'x'):
+            encoding[var] = {
+                'chunks': (1, fire_extent['n_rows'], fire_extent['n_cols']),
+                'compressors': compressor, 
+            }
+        elif ds[var].dims == ('time',):
+            encoding[var] = {'chunks': (1,)}
+    encoding['time'] = {
+        'units': 'minutes since 2000-01-01',
+        'dtype': 'int64',
+    }
+    return encoding
+
+
+def standardize_swaths(fire_name, bbox, start, end, n_timesteps, 
+                       grid_region='conus',grid_resolution=375, 
+                       overwrite=False, make_plots=False, copy_to_s3=False, 
+                       s3_prefix=None, batch_size=50, grid_pad=10,
+                       remove_bowtie=False,deduplicate_scans=False):
+    
+    '''Full workflow for loading and aggregating swath data into a regular grid.'''
+    
+    if copy_to_s3 and s3_prefix is None:
+        raise ValueError("s3_prefix is required when copy_to_s3=True")
+    
+    base_output_dir = os.path.expanduser(f"~/VIIRS_L1_Outputs/{fire_name}_Gridded_VIIRS")
+    step2_plots_dir = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
+    logs_dir = os.path.join(base_output_dir, "Logs")
+    mapping_output_dir = os.path.join(base_output_dir, "Data", "mappings")
+    
+    for directory in [step2_plots_dir, logs_dir, mapping_output_dir]:
+        os.makedirs(directory, exist_ok=True)
+    
+    swath_df = query_available_swath_data(fire_name)
+    grid_meta = create_reference_grid(region=grid_region, resolution=grid_resolution)
+    fire_extent, grid_gdf = create_fire_grid_extent(bbox, grid_meta, pad=grid_pad)
+    
+    print(f"\nReference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m")
+    print(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']} "
+          f"= {fire_extent['n_rows'] * fire_extent['n_cols']:,} cells")
+
+    # ===================================================================
+    # ZARR STORE SETUP
+    # ===================================================================
+    
+    local_zarr_path = f"/tmp/{fire_name}_datacube.zarr" # Local path for fast writes during processing
+    
+    fs = None
+    s3_zarr_path = None
+    if s3_prefix:
+        fs = s3fs.S3FileSystem()
+        s3_zarr_path = f"{s3_prefix}{fire_name}_Gridded_VIIRS/Data/{fire_name}_datacube.zarr"
+    
+    local_zarr_written = False
+    if overwrite and os.path.exists(local_zarr_path):
+        shutil.rmtree(local_zarr_path)
+
+    # Check existing S3 store for resume capability
+    existing_times = set()
+    if s3_zarr_path and fs.exists(s3_zarr_path) and not overwrite:
+        try:
+            store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+            existing_ds = xr.open_zarr(store)
+            existing_times = set(pd.DatetimeIndex(existing_ds['time'].values))
+            existing_ds.close()
+            print(f"Existing Zarr store found with {len(existing_times)} timesteps")
+        except Exception as e:
+            print(f"Could not read existing Zarr store: {e}")
+    
+    existing_s3_store = len(existing_times) > 0 # fixed start up state; True if a zarr already lives on s3. Does not change.
+
+    run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
+    log_path = os.path.join(logs_dir, log_filename)
+    
+    log_file = open(log_path, 'w')
+
+    try:
+
+        log_message("=" * 70, log_file, include_timestamp=False)
+        log_message("STEP 2: SWATH-TO-GRID PROCESSING LOG",log_file, include_timestamp=False)
+        log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", log_file,
+                    include_timestamp=False)
+        log_message("=" * 70, log_file, include_timestamp=False)
+        log_message(f"Fire name: {fire_name}", log_file)
+        log_message(f"BBOX: {bbox}", log_file)
+        log_message(f"Date range: {start} to {end}", log_file)
+        log_message(f"Reference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m",log_file)
+        log_message(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']}",log_file)
+        log_message(f"Zarr path: {s3_zarr_path}",log_file)
+        log_message(f"Batch size: {batch_size}",log_file)
+        log_message(f"Total swath files: {len(swath_df)}",log_file)
+        log_message(f"Max to process: {n_timesteps}",log_file)
+        log_message(f"Overwrite: {overwrite}",log_file)
+        log_message(f"Make plots: {make_plots}",log_file)
+        log_message(f"Existing timesteps: {len(existing_times)}",log_file)
+        log_message("",log_file)
+    
+        # ===================================================================
+        # PROCESS ALL SWATHS
+        # ===================================================================
+    
+        log_message(f"{'=' * 70}", log_file, include_timestamp=False)
+        log_message(f"PROCESSING {min(n_timesteps, len(swath_df))} SWATHS",
+                    log_file, include_timestamp=False)
+        log_message(f"{'=' * 70}",log_file, include_timestamp=False)
+        log_message("",log_file)
+    
+        processed_count = 0
+        skipped_count = 0
+        already_exists_count = 0
+        error_count = 0
+        all_cleaning_reports = []
+    
+        # Batched Zarr write accumulator
+        pending_datasets = []
+        pending_metadata = []  # track what's in the batch for logging
+    
+        # Timing accumulators
+        timing_records = []
+        
+        swaths_to_process = swath_df.iloc[:n_timesteps]
+        pbar = tqdm(swaths_to_process.iterrows(), total=len(swaths_to_process),
+                    desc="Gridding swaths", unit="swath")
+    
+        for idx, swath_info in pbar:
+            
+            sat = swath_info['satellite']
+            timestamp = swath_info['timestamp']
+            filepath = swath_info['filepath']
+            file_timestamp = timestamp.strftime('%Y%m%d_%H%M')
+            
+            pbar.set_description(f"Gridding {sat} {timestamp.strftime('%Y-%m-%d %H:%M')}")
+            
+            # --- Check if already in Zarr ---
+            if not overwrite and pd.Timestamp(timestamp) in existing_times:
+                already_exists_count += 1
+                log_message(f"Skipping {sat}_{file_timestamp} — already in Zarr",log_file,
+                            print_to_console=False)
+                pbar.set_postfix({
+                    'done': processed_count, 'exists': already_exists_count,
+                    'skip': skipped_count, 'err': error_count,
+                    'batch': len(pending_datasets)
+                })
+                continue
+            
+            # --- Check if plot exists ---
+            plot_filename = f"{sat}_{file_timestamp}_gridded.png"
+            plot_output_path = os.path.join(step2_plots_dir, plot_filename)
+            plot_exists = os.path.exists(plot_output_path) if make_plots else False
+            
+            t_total_start = time.time()
+            timing = {'filename': f"{sat}_{file_timestamp}"}
+            
+            try:
+                # ---- Load swath ----
+                t0 = time.time()
+                swath_ds = xr.open_dataset(filepath)
+                timing['t_load'] = time.time() - t0
+                
+                # ---- Map to grid ----
+                t0 = time.time()
+                mapping_df, swath_gdf = map_swath_to_reference_grid(
+                    swath_ds, grid_gdf, verbose=False
+                )
+                timing['t_map'] = time.time() - t0
+                
+                if len(mapping_df) == 0:
+                    skipped_count += 1
+                    log_message(f"Skipping {sat}_{file_timestamp} — no valid mappings",
+                                log_file, print_to_console=False)
+                    swath_ds.close()
+                    del mapping_df, swath_gdf
+                    pbar.set_postfix({
+                        'done': processed_count, 'exists': already_exists_count,
+                        'skip': skipped_count, 'err': error_count,
+                        'batch': len(pending_datasets)
+                    })
+                    continue
+                
+                # ---- Clean (optional)----
+                if remove_bowtie or deduplicate_scans:
+                    t0 = time.time()
+                    mapping_df, report = clean_swath_mapping(mapping_df, swath_gdf, remove_bowtie=remove_bowtie,
+                                                             deduplicate_scans=deduplicate_scans, verbose=False)
+                    timing['t_clean'] = time.time() - t0
+                    
+                    report['filename'] = f"{sat}_{file_timestamp}"
+                    report['satellite'] = sat
+                    report['timestamp'] = str(timestamp)
+                    all_cleaning_reports.append(report)
+                
+                if len(mapping_df) == 0:
+                    skipped_count += 1
+                    log_message(f"Skipping {sat}_{file_timestamp} — no pixels after cleaning",
+                                log_file, print_to_console=False)
+                    swath_ds.close()
+                    pbar.set_postfix({
+                        'done': processed_count, 'exists': already_exists_count,
+                        'skip': skipped_count, 'err': error_count,
+                        'batch': len(pending_datasets)
+                    })
+                    continue
+    
+                # ---- Save mapping ----
+                t0 = time.time()
+                mapping_df.to_parquet(
+                    os.path.join(mapping_output_dir, f"{sat}_{file_timestamp}_mapping.parquet"),
+                    index=False
+                )
+                timing['t_save_mapping'] = time.time() - t0
+                
+                # ---- Aggregate ----
+                t0 = time.time()
+                grid_agg_df = aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=False)
+                timing['t_aggregate'] = time.time() - t0
+                
+                # ---- Convert to xarray ----
+                t0 = time.time()
+                ds = grid_agg_to_xarray(grid_agg_df, fire_extent, grid_meta, swath_ds,
+                                        test=True, verbose=False)
+                timing['t_to_xarray'] = time.time() - t0
+                
+                timing['t_total'] = time.time() - t_total_start
+                timing_records.append(timing)
+                
+                # ---- Accumulate for batched Zarr write ----
+                pending_datasets.append(ds)
+                pending_metadata.append(f"{sat}_{file_timestamp}")
+                
+                log_message(f"Processed: {sat}_{file_timestamp} ({timing['t_total']:.1f}s)",
+                            log_file, print_to_console=False)
+                
+                # ---- Save plot (separate from data pipeline) ----
+                if make_plots and (overwrite or not plot_exists):
+                    try:
+                        plot_gridded_swath(
+                            ds.isel(time=0), swath_ds, grid_meta,
+                            save_path=plot_output_path
+                        )
+                        log_message(f"Plotted: {plot_filename}",log_file, print_to_console=False)
+                    except Exception as plot_err:
+                        log_message(
+                            f"PLOT ERROR {sat}_{file_timestamp}: "
+                            f"{type(plot_err).__name__} - {str(plot_err)}",
+                            log_file, print_to_console=True
+                        )
+                    finally:
+                        plt.close('all')
+                        gc.collect()
+                
+                swath_ds.close()
+                # del mapping_df, swath_gdf, cleaned_df, grid_agg_df
+                processed_count += 1
+                
+                # ---- Flush batch to Zarr if full ----
+                if len(pending_datasets) >= batch_size:
+                    t0 = time.time()
+                    batch_ds = xr.concat(pending_datasets, dim='time')
+                    t_concat = time.time() - t0
+                    
+                    t1 = time.time()
+                    if not local_zarr_written:
+                        encoding = get_zarr_encoding(batch_ds, fire_extent)
+                        batch_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
+                        local_zarr_written = True
+                        log_message(f"Created local Zarr store with {len(pending_datasets)} timesteps "
+                                    f"(concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
+                                    log_file, print_to_console=True)
+                    else:
+                        batch_ds.to_zarr(local_zarr_path, mode='a', append_dim='time')
+                        log_message(f"Appended batch of {len(pending_datasets)} timesteps "
+                                    f"to local Zarr (concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
+                                    log_file, print_to_console=True)
+                    
+                    for d in pending_datasets:
+                        d.close()
+                    batch_ds.close()
+                    del batch_ds
+                    pending_datasets = []
+                    pending_metadata = []
+                    gc.collect()
+                
+                pbar.set_postfix({
+                    'done': processed_count, 'exists': already_exists_count,
+                    'skip': skipped_count, 'err': error_count,
+                    'batch': len(pending_datasets)
+                })
+    
+            except Exception as e:
+                error_count += 1
+                timing['t_total'] = time.time() - t_total_start
+                timing['error'] = f"{type(e).__name__}: {str(e)}"
+                timing_records.append(timing)
+                log_message(f"ERROR {sat}_{file_timestamp}: {type(e).__name__} - {str(e)}",
+                            log_file, print_to_console=True)
+                pbar.set_postfix({
+                    'done': processed_count, 'exists': already_exists_count,
+                    'skip': skipped_count, 'err': error_count,
+                    'batch': len(pending_datasets)
+                })
+                continue
+    
+        pbar.close()
+        
+        # ===================================================================
+        # FLUSH REMAINING BATCH
+        # ===================================================================
+    
+        if len(pending_datasets) > 0:
+            log_message(f"\nFlushing final batch of {len(pending_datasets)} timesteps...",
+                       log_file)
+            
+            t0 = time.time()
+            batch_ds = xr.concat(pending_datasets, dim='time')
+            
+            if not local_zarr_written:
+                encoding = get_zarr_encoding(batch_ds, fire_extent)
+                batch_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
+                local_zarr_written = True
+            else:
+                batch_ds.to_zarr(local_zarr_path, mode='a', append_dim='time')
+            
+            t_write = time.time() - t0
+            log_message(f"Final batch written ({t_write:.1f}s)",log_file)
+            
+            for d in pending_datasets:
+                d.close()
+            batch_ds.close()
+            del batch_ds
+            pending_datasets = []
+            gc.collect()
+    
+    
+        # ===================================================================
+        # COPY LOCAL ZARR TO S3
+        # ===================================================================
+        
+        if local_zarr_written and copy_to_s3:
+            if existing_s3_store:
+                # Resume — append only new timesteps
+                log_message("Appending new timesteps to existing S3 store...",log_file)
+                t0 = time.time()
+                
+                local_ds = xr.open_zarr(local_zarr_path)
+                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                local_ds.to_zarr(store, mode='a', append_dim='time')
+                local_ds.close()
+                
+                zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
+                
+                log_message(f"Appended to S3 ({time.time() - t0:.1f}s)",log_file)
+            else:
+                # Fresh run — full copy
+                log_message("Copying Zarr store to S3...",log_file)
+                t0 = time.time()
+                
+                if fs.exists(s3_zarr_path):
+                    fs.rm(s3_zarr_path, recursive=True)
+                
+                local_ds = xr.open_zarr(local_zarr_path)
+                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                encoding = get_zarr_encoding(local_ds, fire_extent)
+                local_ds.to_zarr(store, mode='w', encoding=encoding)
+                local_ds.close()
+                
+                zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
+                
+                log_message(f"Copied to {s3_zarr_path} ({time.time() - t0:.1f}s)",log_file)
+            
+        else:
+            log_message("No new data written — skipping S3 copy",log_file)
+    
+        # ===================================================================
+        # SUMMARY
+        # ===================================================================
+    
+        log_message(f"\n{'=' * 70}", log_file, include_timestamp=False)
+        log_message("PROCESSING COMPLETE", log_file, include_timestamp=False)
+        log_message(f"{'=' * 70}", log_file, include_timestamp=False)
+        log_message(f"  Successfully processed: {processed_count}", log_file)
+        log_message(f"  Already existed (skipped): {already_exists_count}", log_file)
+        log_message(f"  Skipped (no data/empty): {skipped_count}", log_file)
+        log_message(f"  Errors: {error_count}", log_file)
+        log_message(f"  Total: {processed_count + already_exists_count + skipped_count + error_count}",
+                   log_file)
+    
+        # Cleaning summary
+        if len(all_cleaning_reports) > 0:
+            reports_df = pd.DataFrame(all_cleaning_reports)
+            
+            log_message(f"\n  Cleaning statistics across {len(reports_df)} swaths:", log_file)
+            log_message(f"    Mean bowtie removed: "
+                        f"{reports_df.get('bowtie_removed', pd.Series([0])).mean():.1f}",log_file)
+            log_message(f"    Mean dedup removed: "
+                        f"{reports_df.get('dedup_removed', pd.Series([0])).mean():.1f}",log_file)
+            log_message(f"    Mean % removed: {reports_df['pct_removed'].mean():.1f}%",log_file)
+            log_message(f"    Max % removed: {reports_df['pct_removed'].max():.1f}%",log_file)
+    
+        # Timing summary
+        if len(timing_records) > 0:
+            timing_df = pd.DataFrame(timing_records)
+            if 'error' in timing_df.columns:
+                completed = timing_df[timing_df['error'].isna()].copy()
+            else:
+                completed = timing_df.copy()
+            
+            if len(completed) > 0:
+                step_cols = ['t_load', 't_map', 't_clean', 't_save_mapping', 't_aggregate', 't_to_xarray']
+                available_steps = [c for c in step_cols if c in completed.columns]
+                
+                log_message(f"\n  Timing (excluding Zarr writes):",log_file)
+                for col in available_steps:
+                    vals = completed[col]
+                    log_message(f"    {col}: mean={vals.mean():.2f}s, total={vals.sum():.1f}s",
+                               log_file)
+                
+                t_processing = sum(completed[c].sum() for c in available_steps)
+                log_message(f"    Processing total: {t_processing:.1f}s ({t_processing/60:.1f} min)",
+                           log_file)
+    
+        # Zarr store summary
+        if (existing_s3_store or local_zarr_written) and s3_zarr_path:
+            try:
+                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                final_ds = xr.open_zarr(store)
+                log_message(f"\n  Zarr datacube summary:",log_file)
+                log_message(f"    Path: {s3_zarr_path}",log_file)
+                log_message(f"    Time steps: {final_ds.sizes['time']}",log_file)
+                log_message(f"    Spatial dims: y={final_ds.sizes['y']}, x={final_ds.sizes['x']}",log_file)
+                log_message(f"    Variables: {len(final_ds.data_vars)}",log_file)
+                log_message(f"    Time range: {final_ds.time.values[0]} to {final_ds.time.values[-1]}",log_file)
+                final_ds.close()
+            except Exception as e:
+                log_message(f"  Could not read final Zarr store: {e}",log_file)
+    
+        log_message(f"\nOutputs:",log_file)
+        log_message(f"  Zarr: {s3_zarr_path}",log_file)
+        if make_plots:
+            log_message(f"  Plots: {step2_plots_dir}",log_file)
+        log_message(f"  Log: {log_path}",log_file)
+        log_message(f"\nRun completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",log_file)
+    
+    finally:
+        log_file.close()
+    
+    print(f"\n{'=' * 70}")
+    print(f"Log file saved: {log_path}")
+    print(f"{'=' * 70}")
