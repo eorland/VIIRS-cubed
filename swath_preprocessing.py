@@ -1539,4 +1539,6 @@ if __name__ == "__main__":
     #     --n_timesteps -1 \
     #     --sensors '["SNPP", "NOAA20", "NOAA21"]' \
     #     --copy_to_s3 \
-    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/'
+    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
+    #     --output_dir 'VIIRS-cubed-outputs' \    
+    #     --overwrite \

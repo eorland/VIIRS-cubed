@@ -2386,3 +2386,181 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     print(f"\n{'=' * 70}")
     print(f"Log file saved: {log_path}")
     print(f"{'=' * 70}")
+
+
+if __name__ == "__main__":
+
+    import argparse
+    import ast
+
+    parser = argparse.ArgumentParser(
+        description="Standardize and grid VIIRS swath data into a Zarr datacube."
+    )
+
+    # ===================================================================
+    # REQUIRED ARGUMENTS
+    # ===================================================================
+
+    parser.add_argument(
+        "--fire_name",
+        type=str,
+        required=True,
+        help="Name of the fire/region (used for output directory naming). E.g. 'Stanford_Flaring'"
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        required=True,
+        help="Start date for data query in YYYY-MM-DD format. E.g. '2026-05-10'"
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        required=True,
+        help="End date for data query in YYYY-MM-DD format. E.g. '2026-08-30'"
+    )
+    parser.add_argument(
+        "--bbox",
+        type=str,
+        required=True,
+        help="Bounding box as '[xmin, ymin, xmax, ymax]'. E.g. --bbox '[-112.25, 32.25, -111.25, 33.25]'"
+    )
+    parser.add_argument(
+        "--n_timesteps",
+        type=int,
+        default=-1,
+        help="Number of timesteps to process. Use -1 (default) to process all."
+    )
+
+    # ===================================================================
+    # OPTIONAL ARGUMENTS
+    # ===================================================================
+
+    parser.add_argument(
+        "--grid_region",
+        type=str,
+        default='conus',
+        help="Reference grid region. Options: 'conus', 'global', 'custom'. Default: 'conus'."
+    )
+    parser.add_argument(
+        "--grid_resolution",
+        type=int,
+        default=375,
+        help="Reference grid cell size in meters. Default: 375."
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="If set, reprocess and overwrite existing output files."
+    )
+    parser.add_argument(
+        "--make_plots",
+        action="store_true",
+        default=False,
+        help="If set, generate and save gridded swath plots."
+    )
+    parser.add_argument(
+        "--copy_to_s3",
+        action="store_true",
+        default=False,
+        help="If set, copy outputs to S3 after processing."
+    )
+    parser.add_argument(
+        "--s3_prefix",
+        type=str,
+        default=None,
+        help="S3 destination prefix. Required if --copy_to_s3 is set. E.g. 's3://my-bucket/outputs/'"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default='VIIRS-cubed-outputs',
+        help="Local base directory for all outputs. Defaults to 'VIIRS-cubed-outputs'."
+    )
+    parser.add_argument(
+        "--remove_local",
+        action="store_true",
+        default=False,
+        help="If set, remove local output files after a successful S3 upload. Requires --copy_to_s3."
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=50,
+        help="Number of swaths to accumulate before flushing to the local Zarr store. Default: 50."
+    )
+    parser.add_argument(
+        "--grid_pad",
+        type=int,
+        default=10,
+        help="Extra grid cells of padding around the bounding box. Default: 10."
+    )
+    parser.add_argument(
+        "--remove_bowtie",
+        action="store_true",
+        default=False,
+        help="If set, remove bowtie-affected pixels before aggregation."
+    )
+    parser.add_argument(
+        "--deduplicate_scans",
+        action="store_true",
+        default=False,
+        help="If set, deduplicate overlapping scan lines before aggregation."
+    )
+
+    args = parser.parse_args()
+
+    # ===================================================================
+    # VALIDATE ARGUMENT COMBINATIONS
+    # ===================================================================
+
+    if args.copy_to_s3 and args.s3_prefix is None:
+        parser.error("--s3_prefix is required when --copy_to_s3 is set.")
+    if args.remove_local and not args.copy_to_s3:
+        parser.error("--remove_local requires --copy_to_s3.")
+
+    # ===================================================================
+    # CALL standardize_swaths
+    # ===================================================================
+
+    bbox = ast.literal_eval(args.bbox)
+
+    standardize_swaths(
+        fire_name=args.fire_name,
+        bbox=bbox,
+        start=args.start,
+        end=args.end,
+        n_timesteps=args.n_timesteps,
+        grid_region=args.grid_region,
+        grid_resolution=args.grid_resolution,
+        overwrite=args.overwrite,
+        make_plots=args.make_plots,
+        copy_to_s3=args.copy_to_s3,
+        s3_prefix=args.s3_prefix,
+        output_dir=args.output_dir,
+        remove_local=args.remove_local,
+        batch_size=args.batch_size,
+        grid_pad=args.grid_pad,
+        remove_bowtie=args.remove_bowtie,
+        deduplicate_scans=args.deduplicate_scans
+    )
+
+    # ===================================================================
+    # USAGE EXAMPLE
+    # ===================================================================
+    #
+    # python standardizations.py \
+    #     --fire_name 'Dragon_Bravo_TEST' \
+    #     --start '2025-07-01' \
+    #     --end '2025-07-10' \
+    #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
+    #     --n_timesteps -1 \
+    #     --grid_region 'conus' \
+    #     --grid_resolution 375 \
+    #     --batch_size 50 \
+    #     --grid_pad 10 \
+    #     --copy_to_s3 \
+    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
+    #     --output_dir 'VIIRS-cubed-outputs' \
+    #     --overwrite \
