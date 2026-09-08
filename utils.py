@@ -28,6 +28,7 @@ def compute_fire_persistence_baseline(
     n_total : n_am + n_pm (total in-window detections).
     dp_ratio : n_total / (number of valid, non-NaN in-window observations).
         Bounded (0, 1] for any ignited pixel; NaN where no ignition.
+    n_cloud_detection_windows : count of in-window timesteps with fire_mask == 4 (cloud)
 
     Parameters
     ----------
@@ -37,7 +38,7 @@ def compute_fire_persistence_baseline(
         Name of the fire mask variable ('fire_mask_max' or
         'fire_mask_area_weighted_majority').
     suffix : str
-        Suffix appended to all output variable names (e.g. '_aw', '_max').
+        Suffix appended to all output variable names (e.g. 'aw', 'max').
     start_fire_mask_value : int
         Fire mask threshold for ignition (>=). Default 6.
     end_fire_mask_value : int
@@ -47,10 +48,10 @@ def compute_fire_persistence_baseline(
     -------
     all_data : xr.Dataset
         Copy of input with new variables added:
-          persistence_hours_baseline{suffix}, t_fire_start{suffix},
-          t_fire_end_baseline{suffix}, n_am_detection_windows{suffix},
-          n_pm_detection_windows{suffix}, n_total_detection_windows{suffix},
-          dp_ratio{suffix}
+          persistence_hours_baseline_{suffix}, t_fire_start_{suffix},
+          t_fire_end_baseline_{suffix}, n_am_detection_windows_{suffix},
+          n_pm_detection_windows_{suffix}, n_total_detection_windows_{suffix},
+          dp_ratio_{suffix}, n_cloud_detection_windows_{suffix}
     """
 
     # set all -1 values in to NaN for proper handling of min/max and counts.
