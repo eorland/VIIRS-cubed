@@ -27,6 +27,7 @@ import fsspec
 
 # from preprocessing script
 from swath_preprocessing import log_message
+from utils import compute_fire_persistence_baseline
 
 # Plotting and visualization
 import seaborn as sns
@@ -1942,19 +1943,44 @@ def get_zarr_encoding(ds, fire_extent):
     return encoding
 
 
+def _write_persistence_vars(ds_with_persistence, zarr_store, suffix_list):
+    """Write only the persistence variables into zarr_store, in-place."""
+    _var_templates = [
+        'persistence_hours_baseline_{s}', 't_fire_start_{s}',
+        't_fire_end_baseline_{s}',        'n_am_detection_windows_{s}',
+        'n_pm_detection_windows_{s}',     'n_total_detection_windows_{s}',
+        'dp_ratio_{s}',                   'n_cloud_detection_windows_{s}',
+    ]
+    z = zarr.open(zarr_store, mode='r+')
+    for suffix in suffix_list:
+        for tmpl in _var_templates:
+            var_name = tmpl.format(s=suffix)
+            arr = ds_with_persistence[var_name].compute().values
+            if var_name in z:
+                z[var_name][:] = arr
+            else:
+                z.create_dataset(var_name, data=arr, overwrite=True)
+    zarr.consolidate_metadata(zarr_store)
+
+
 def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                        grid_region='conus', grid_resolution=375,
                        overwrite=False, make_plots=False, copy_to_s3=False,
                        s3_prefix=None, batch_size=50, grid_pad=10,
                        remove_bowtie=False, deduplicate_scans=False,
-                       output_dir='VIIRS-cubed-outputs', remove_local=False):
-    
+                       output_dir='VIIRS-cubed-outputs', remove_local=False,
+                       add_persistence=False, persistence_fire_mask_col=None,
+                       persistence_suffix=None, persistence_start_threshold=6,
+                       persistence_end_threshold=6):
+
     '''Full workflow for loading and aggregating swath data into a regular grid.'''
-    
+
     if copy_to_s3 and s3_prefix is None:
         raise ValueError("s3_prefix is required when copy_to_s3=True")
     if remove_local and not copy_to_s3:
         raise ValueError("remove_local=True requires copy_to_s3=True")
+    if persistence_fire_mask_col is not None and persistence_suffix is None:
+        raise ValueError("persistence_suffix is required when persistence_fire_mask_col is set")
 
     base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
     step2_plots_dir = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
@@ -1977,30 +2003,47 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     # ===================================================================
     
     local_zarr_path = os.path.join(base_output_dir, "Data", f"{fire_name}_datacube.zarr")
-    
+    # initialize fs and s3 path variables
     fs = None
     s3_zarr_path = None
     if s3_prefix:
         fs = s3fs.S3FileSystem()
         s3_zarr_path = f"{s3_prefix}{fire_name}_Gridded_VIIRS/Data/{fire_name}_datacube.zarr"
     
-    local_zarr_written = False
-    if overwrite and os.path.exists(local_zarr_path):
-        shutil.rmtree(local_zarr_path)
+    # Handle existing local Zarr: remove if overwriting, otherwise append new timesteps to it
+    if os.path.exists(local_zarr_path):
+        if overwrite:
+            shutil.rmtree(local_zarr_path)
+            local_zarr_written = False
+        else:
+            local_zarr_written = True  # append to it; prevents mode='w' on first batch flush
+    else:
+        local_zarr_written = False
 
-    # Check existing S3 store for resume capability
+    # Populate existing_times for per-swath skip logic
     existing_times = set()
+
     if s3_zarr_path and fs.exists(s3_zarr_path) and not overwrite:
+        # S3 is the reference copy — read existing timesteps from S3 Zarr
         try:
             store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
             existing_ds = xr.open_zarr(store)
             existing_times = set(pd.DatetimeIndex(existing_ds['time'].values))
             existing_ds.close()
-            print(f"Existing Zarr store found with {len(existing_times)} timesteps")
+            print(f"Existing S3 Zarr store found with {len(existing_times)} timesteps")
         except Exception as e:
-            print(f"Could not read existing Zarr store: {e}")
-    
-    existing_s3_store = len(existing_times) > 0 # fixed start up state; True if a zarr already lives on s3. Does not change.
+            print(f"Could not read existing S3 Zarr store: {e}")
+    elif local_zarr_written:
+        # Local is the reference copy — read existing timesteps from local Zarr
+        try:
+            local_ds = xr.open_zarr(local_zarr_path)
+            existing_times = set(pd.DatetimeIndex(local_ds['time'].values))
+            local_ds.close()
+            print(f"Existing local Zarr store found with {len(existing_times)} timesteps")
+        except Exception as e:
+            print(f"Could not read existing local Zarr store: {e}")
+
+    existing_s3_store = s3_zarr_path is not None and len(existing_times) > 0 and not overwrite
 
     run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
@@ -2256,15 +2299,15 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
             
             t_write = time.time() - t0
             log_message(f"Final batch written ({t_write:.1f}s)",log_file)
-            
+
             for d in pending_datasets:
                 d.close()
             batch_ds.close()
             del batch_ds
             pending_datasets = []
             gc.collect()
-    
-    
+
+
         # ===================================================================
         # COPY LOCAL ZARR TO S3
         # ===================================================================
@@ -2309,7 +2352,70 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
         else:
             log_message("No new data written — skipping S3 copy",log_file)
-    
+
+
+        # ===================================================================
+        # PERSISTENCE CALCULATION
+        # ===================================================================
+
+        if add_persistence:
+            if persistence_fire_mask_col is None:
+                _suffixes = ['max', 'aw']
+                _cols = ['fire_mask_max', 'fire_mask_area_weighted_majority']
+            else:
+                _suffixes = [persistence_suffix]
+                _cols = [persistence_fire_mask_col]
+
+            if not local_zarr_written:
+                log_message("Skipping persistence — no Zarr store was written this run.", log_file)
+
+            elif copy_to_s3:
+                # S3 is truth — compute from the full S3 store (all timesteps present after append)
+                log_message("Computing fire persistence metrics from S3 store...", log_file)
+                s3_store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                all_data = xr.open_zarr(s3_store)
+                for col, suf in zip(_cols, _suffixes):
+                    all_data = compute_fire_persistence_baseline(
+                        all_data, col, suf,
+                        start_fire_mask_value=persistence_start_threshold,
+                        end_fire_mask_value=persistence_end_threshold,
+                    )
+                _write_persistence_vars(all_data, s3_store, _suffixes)
+                all_data.close()
+                log_message("Persistence metrics written to S3 Zarr.", log_file)
+
+                # Mirror full S3 store (including persistence) to local if local was kept
+                if not remove_local:
+                    log_message("Mirroring full S3 store to local Zarr...", log_file)
+                    full_ds = xr.open_zarr(s3_store)
+                    encoding = get_zarr_encoding(full_ds, fire_extent)
+                    full_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
+                    full_ds.close()
+                    log_message("Local Zarr updated from S3.", log_file)
+
+            else:
+                # Local is truth
+                if existing_s3_store:
+                    log_message(
+                        "WARNING: Skipping persistence — copy_to_s3=False but S3 has prior data "
+                        "this local run is unaware of. Re-run with copy_to_s3=True to compute "
+                        "persistence over the full accumulated dataset.",
+                        log_file
+                    )
+                else:
+                    log_message("Computing fire persistence metrics from local Zarr...", log_file)
+                    all_data = xr.open_zarr(local_zarr_path)
+                    for col, suf in zip(_cols, _suffixes):
+                        all_data = compute_fire_persistence_baseline(
+                            all_data, col, suf,
+                            start_fire_mask_value=persistence_start_threshold,
+                            end_fire_mask_value=persistence_end_threshold,
+                        )
+                    _write_persistence_vars(all_data, local_zarr_path, _suffixes)
+                    all_data.close()
+                    log_message("Persistence metrics written to local Zarr.", log_file)
+
+
         # ===================================================================
         # SUMMARY
         # ===================================================================
@@ -2508,6 +2614,36 @@ if __name__ == "__main__":
         default=False,
         help="If set, deduplicate overlapping scan lines before aggregation."
     )
+    parser.add_argument(
+        "--add_persistence",
+        action="store_true",
+        default=False,
+        help="If set, compute fire persistence metrics after gridding and write them to the Zarr store."
+    )
+    parser.add_argument(
+        "--persistence_fire_mask_col",
+        type=str,
+        default=None,
+        help="Fire mask column to use for persistence. If not set, runs both 'fire_mask_max' and 'fire_mask_area_weighted_majority'."
+    )
+    parser.add_argument(
+        "--persistence_suffix",
+        type=str,
+        default=None,
+        help="Suffix for persistence output variables. Required when --persistence_fire_mask_col is set."
+    )
+    parser.add_argument(
+        "--persistence_start_threshold",
+        type=int,
+        default=6,
+        help="Fire mask threshold for ignition detection. Default: 6."
+    )
+    parser.add_argument(
+        "--persistence_end_threshold",
+        type=int,
+        default=6,
+        help="Fire mask threshold for sustained detection. Default: 6."
+    )
 
     args = parser.parse_args()
 
@@ -2519,6 +2655,8 @@ if __name__ == "__main__":
         parser.error("--s3_prefix is required when --copy_to_s3 is set.")
     if args.remove_local and not args.copy_to_s3:
         parser.error("--remove_local requires --copy_to_s3.")
+    if args.persistence_fire_mask_col is not None and args.persistence_suffix is None:
+        parser.error("--persistence_suffix is required when --persistence_fire_mask_col is set.")
 
     # ===================================================================
     # CALL standardize_swaths
@@ -2543,7 +2681,12 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         grid_pad=args.grid_pad,
         remove_bowtie=args.remove_bowtie,
-        deduplicate_scans=args.deduplicate_scans
+        deduplicate_scans=args.deduplicate_scans,
+        add_persistence=args.add_persistence,
+        persistence_fire_mask_col=args.persistence_fire_mask_col,
+        persistence_suffix=args.persistence_suffix,
+        persistence_start_threshold=args.persistence_start_threshold,
+        persistence_end_threshold=args.persistence_end_threshold,
     )
 
     # ===================================================================
@@ -2564,3 +2707,6 @@ if __name__ == "__main__":
     #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
     #     --output_dir 'VIIRS-cubed-outputs' \
     #     --overwrite \
+    #     --add_persistence \
+    #     --persistence_start_threshold 6 \
+    #     --persistence_end_threshold 6

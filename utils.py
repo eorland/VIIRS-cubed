@@ -102,7 +102,7 @@ def compute_fire_persistence_baseline(
     dp_ratio = (n_total / n_valid).astype('float32').where(has_start) # this can't be greater than 1
 
     # BONUS: return count of 'cloud' pixels - these could also be smoke
-    n_cloud = (fm == 4 & in_window).sum('time')
+    n_cloud = ((fm == 4) & in_window).sum('time')
 
     # --- Store results ---
     out = {
