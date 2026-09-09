@@ -1,5 +1,19 @@
+import datetime as dt
+
 import numpy as np
 import xarray as xr
+
+
+def log_message(message, log_file, print_to_console=True, include_timestamp=True):
+    if include_timestamp:
+        timestamp = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        formatted_message = f"[{timestamp}] {message}"
+    else:
+        formatted_message = message
+    log_file.write(formatted_message + '\n')
+    log_file.flush()
+    if print_to_console:
+        print(formatted_message)
 
 
 def compute_fire_persistence_baseline(

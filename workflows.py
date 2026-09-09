@@ -1,8 +1,10 @@
 import ast
+import datetime as dt
 import os
 
 from swath_preprocessing import process_swaths
 from standardizations import standardize_swaths
+from utils import log_message
 
 
 def process_single_fire(
@@ -41,6 +43,9 @@ def process_single_fire(
     persistence_suffix=None,
     persistence_start_threshold=6,
     persistence_end_threshold=6,
+
+    # --- Workflow-level logging ---
+    save_workflow_log=True,
 ):
     '''Preprocess and standardize VIIRS swath data for a single fire/region.
 
@@ -104,6 +109,11 @@ def process_single_fire(
         Fire mask value threshold for ignition detection. Default: 6.
     persistence_end_threshold : int, optional
         Fire mask value threshold for sustained detection. Default: 6.
+    save_workflow_log : bool, optional
+        If True, a single log file spanning both steps is written to
+        ``{output_dir}/{fire_name}_Gridded_VIIRS/Logs/`` alongside the
+        per-step logs. Filename: ``{fire_name}_workflow_log_{timestamp}.txt``.
+        Default: True.
     '''
     if copy_to_s3 and s3_prefix is None:
         raise ValueError("s3_prefix is required when copy_to_s3=True")
@@ -112,64 +122,104 @@ def process_single_fire(
     if persistence_fire_mask_col is not None and persistence_suffix is None:
         raise ValueError("persistence_suffix is required when persistence_fire_mask_col is set")
 
-    # ===================================================================
-    # STEP 1: SWATH PREPROCESSING
-    # ===================================================================
+    # Open workflow-level log if requested
+    wf_log = None
+    if save_workflow_log:
+        logs_dir = os.path.join(
+            os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS", "Logs"
+        )
+        os.makedirs(logs_dir, exist_ok=True)
+        run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        workflow_log_path = os.path.join(
+            logs_dir, f"{fire_name}_workflow_log_{run_timestamp}.txt"
+        )
+        wf_log = open(workflow_log_path, 'a')
+        log_message("=" * 70, wf_log, include_timestamp=False)
+        log_message("VIIRS WORKFLOW LOG", wf_log, include_timestamp=False)
+        log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    wf_log, include_timestamp=False)
+        log_message("=" * 70, wf_log, include_timestamp=False)
+        log_message(f"Fire name: {fire_name}", wf_log)
+        log_message(f"Date range: {start} to {end}", wf_log)
+        log_message(f"BBOX: {bbox}", wf_log)
+        log_message("", wf_log, include_timestamp=False)
 
-    print(f"\n{'='*60}")
-    print(f"STEP 1: Preprocessing swaths for {fire_name}")
-    print(f"{'='*60}\n")
+    try:
+        # ===================================================================
+        # STEP 1: SWATH PREPROCESSING
+        # ===================================================================
 
-    process_swaths(
-        fire_name=fire_name,
-        start=start,
-        end=end,
-        bbox=bbox,
-        n_timesteps=n_timesteps,
-        pix_lut_path=pix_lut_path,
-        sensors=sensors,
-        make_plots=make_plots,
-        save_data=save_data,
-        overwrite=overwrite,
-        run_spatial_test=run_spatial_test,
-        copy_to_s3=copy_to_s3,
-        s3_prefix=s3_prefix,
-        output_dir=output_dir,
-        remove_local=remove_local,
-    )
+        if wf_log:
+            log_message("--- STEP 1: Swath Preprocessing ---", wf_log)
+        print(f"\n{'='*60}")
+        print(f"STEP 1: Preprocessing swaths for {fire_name}")
+        print(f"{'='*60}\n")
 
-    # ===================================================================
-    # STEP 2: STANDARDIZATION (+ optional persistence)
-    # ===================================================================
+        process_swaths(
+            fire_name=fire_name,
+            start=start,
+            end=end,
+            bbox=bbox,
+            n_timesteps=n_timesteps,
+            pix_lut_path=pix_lut_path,
+            sensors=sensors,
+            make_plots=make_plots,
+            save_data=save_data,
+            overwrite=overwrite,
+            run_spatial_test=run_spatial_test,
+            copy_to_s3=copy_to_s3,
+            s3_prefix=s3_prefix,
+            output_dir=output_dir,
+            remove_local=remove_local,
+            log_file=wf_log,
+        )
 
-    print(f"\n{'='*60}")
-    print(f"STEP 2: Standardizing swaths for {fire_name}")
-    print(f"{'='*60}\n")
+        # ===================================================================
+        # STEP 2: STANDARDIZATION (+ optional persistence)
+        # ===================================================================
 
-    standardize_swaths(
-        fire_name=fire_name,
-        bbox=bbox,
-        start=start,
-        end=end,
-        n_timesteps=n_timesteps,
-        grid_region=grid_region,
-        grid_resolution=grid_resolution,
-        overwrite=overwrite,
-        make_plots=make_plots,
-        copy_to_s3=copy_to_s3,
-        s3_prefix=s3_prefix,
-        batch_size=batch_size,
-        grid_pad=grid_pad,
-        remove_bowtie=remove_bowtie,
-        deduplicate_scans=deduplicate_scans,
-        output_dir=output_dir,
-        remove_local=remove_local,
-        add_persistence=add_persistence,
-        persistence_fire_mask_col=persistence_fire_mask_col,
-        persistence_suffix=persistence_suffix,
-        persistence_start_threshold=persistence_start_threshold,
-        persistence_end_threshold=persistence_end_threshold,
-    )
+        if wf_log:
+            log_message("", wf_log, include_timestamp=False)
+            log_message("--- STEP 2: Standardization ---", wf_log)
+        print(f"\n{'='*60}")
+        print(f"STEP 2: Standardizing swaths for {fire_name}")
+        print(f"{'='*60}\n")
+
+        standardize_swaths(
+            fire_name=fire_name,
+            bbox=bbox,
+            start=start,
+            end=end,
+            n_timesteps=n_timesteps,
+            grid_region=grid_region,
+            grid_resolution=grid_resolution,
+            overwrite=overwrite,
+            make_plots=make_plots,
+            copy_to_s3=copy_to_s3,
+            s3_prefix=s3_prefix,
+            batch_size=batch_size,
+            grid_pad=grid_pad,
+            remove_bowtie=remove_bowtie,
+            deduplicate_scans=deduplicate_scans,
+            output_dir=output_dir,
+            remove_local=remove_local,
+            add_persistence=add_persistence,
+            persistence_fire_mask_col=persistence_fire_mask_col,
+            persistence_suffix=persistence_suffix,
+            persistence_start_threshold=persistence_start_threshold,
+            persistence_end_threshold=persistence_end_threshold,
+            log_file=wf_log,
+        )
+
+    finally:
+        if wf_log is not None:
+            log_message("", wf_log, include_timestamp=False)
+            log_message(f"Workflow completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        wf_log, include_timestamp=False)
+            wf_log.close()
+            print(f"\n{'='*60}")
+            print(f"Workflow log saved: {workflow_log_path}")
+            print(f"{'='*60}")
 
 
 if __name__ == '__main__':
@@ -344,6 +394,12 @@ if __name__ == '__main__':
         default=6,
         help="Fire mask threshold for sustained detection. Default: 6."
     )
+    parser.add_argument(
+        "--save_workflow_log",
+        action="store_true",
+        default=True,
+        help="If set, write a single log spanning both pipeline steps to the fire's Logs/ directory."
+    )
 
     args = parser.parse_args()
 
@@ -392,6 +448,7 @@ if __name__ == '__main__':
         persistence_suffix=args.persistence_suffix,
         persistence_start_threshold=args.persistence_start_threshold,
         persistence_end_threshold=args.persistence_end_threshold,
+        save_workflow_log=args.save_workflow_log,
     )
 
     # ===================================================================
@@ -413,4 +470,5 @@ if __name__ == '__main__':
     #     --copy_to_s3 \
     #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
     #     --output_dir 'VIIRS-cubed-outputs' \
-    #     --overwrite
+    #     --overwrite \
+    #     --save_workflow_log

@@ -25,9 +25,7 @@ import shutil
 import gc
 import fsspec
 
-# from preprocessing script
-from swath_preprocessing import log_message
-from utils import compute_fire_persistence_baseline
+from utils import log_message, compute_fire_persistence_baseline
 
 # Plotting and visualization
 import seaborn as sns
@@ -1971,7 +1969,8 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                        output_dir='VIIRS-cubed-outputs', remove_local=False,
                        add_persistence=False, persistence_fire_mask_col=None,
                        persistence_suffix=None, persistence_start_threshold=6,
-                       persistence_end_threshold=6):
+                       persistence_end_threshold=6,
+                       log_file=None):
 
     '''Full workflow for loading and aggregating swath data into a regular grid.'''
 
@@ -2048,8 +2047,10 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
     log_path = os.path.join(logs_dir, log_filename)
-    
-    log_file = open(log_path, 'w')
+
+    _owns_log = log_file is None
+    if _owns_log:
+        log_file = open(log_path, 'w')
 
     try:
 
@@ -2483,15 +2484,18 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         log_message(f"  Zarr: {s3_zarr_path}",log_file)
         if make_plots:
             log_message(f"  Plots: {step2_plots_dir}",log_file)
-        log_message(f"  Log: {log_path}",log_file)
+        if _owns_log:
+            log_message(f"  Log: {log_path}",log_file)
         log_message(f"\nRun completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",log_file)
-    
+
     finally:
-        log_file.close()
-    
-    print(f"\n{'=' * 70}")
-    print(f"Log file saved: {log_path}")
-    print(f"{'=' * 70}")
+        if _owns_log:
+            log_file.close()
+
+    if _owns_log:
+        print(f"\n{'=' * 70}")
+        print(f"Log file saved: {log_path}")
+        print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

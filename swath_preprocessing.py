@@ -25,6 +25,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.mpl.gridliner
 
+from utils import log_message
+
 
 def gather_filepaths(bbox, start, end, sensors):
     '''
@@ -1090,34 +1092,12 @@ def test_spatial_alignment(swath, tolerance_degrees=0.0001, tolerance_temp=0.1, 
         }
     }
 
-def log_message(message, log_file, print_to_console=True, include_timestamp=True):
-    """Write message to both log file and optionally console.
-    
-    Parameters
-    ----------
-    message : str
-        The message to log
-    print_to_console : bool, default=True
-        Whether to also print to console
-    include_timestamp : bool, default=True
-        Whether to prepend timestamp to message
-    """
-    if include_timestamp:
-        timestamp = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        formatted_message = f"[{timestamp}] {message}"
-    else:
-        formatted_message = message
-    
-    log_file.write(formatted_message + '\n')
-    log_file.flush()  # Ensure it's written immediately
-    if print_to_console:
-        print(formatted_message)
-
 def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                    sensors=['SNPP', 'NOAA20', 'NOAA21'], make_plots=False,
                    save_data=True, overwrite=False, run_spatial_test=True,
                    copy_to_s3=False, s3_prefix=None,
-                   output_dir='VIIRS-cubed-outputs', remove_local=False):
+                   output_dir='VIIRS-cubed-outputs', remove_local=False,
+                   log_file=None):
 
     '''
     Main orchestration function which processes an arbitrary number
@@ -1155,8 +1135,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     log_filename = f"{fire_name}_processing_log_{run_timestamp}.txt"
     log_path = os.path.join(logs_dir, log_filename)
 
-    # Open log file
-    log_file = open(log_path, 'w')
+    _owns_log = log_file is None
+    if _owns_log:
+        log_file = open(log_path, 'w')
 
     # Log header (without timestamps for clean formatting)
     log_message("="*70, log_file, include_timestamp=False)
@@ -1373,12 +1354,12 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     if make_plots:
         log_message(f"  Plot files: {plots_dir}", log_file,)
     
-    log_message(f"\nLog saved to: {log_path}", log_file,)
+    if _owns_log:
+        log_message(f"\nLog saved to: {log_path}", log_file,)
     log_message(f"Run completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", log_file,)
-    
-    # Close log file before S3 upload so it's complete
-    log_file.close()
 
+    if _owns_log:
+        log_file.close()
 
     return
 
