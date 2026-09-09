@@ -1953,11 +1953,17 @@ def _write_persistence_vars(ds_with_persistence, zarr_store, suffix_list):
     for suffix in suffix_list:
         for tmpl in _var_templates:
             var_name = tmpl.format(s=suffix)
-            arr = ds_with_persistence[var_name].compute().values
+            da = ds_with_persistence[var_name]
+            arr = da.compute().values
             if var_name in z:
                 z[var_name][:] = arr
             else:
-                z.create_dataset(var_name, data=arr, overwrite=True)
+                z.create_array(
+                    var_name,
+                    data=arr,
+                    dimension_names=da.dims,
+                    overwrite=True,
+                )
     zarr.consolidate_metadata(zarr_store)
 
 
