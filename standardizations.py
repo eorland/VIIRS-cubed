@@ -2071,7 +2071,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         log_message(f"Date range: {start} to {end}", log_file)
         log_message(f"Reference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m",log_file)
         log_message(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']}",log_file)
-        log_message(f"Zarr path: {s3_zarr_path}",log_file)
+        log_message(f"Zarr path: {s3_zarr_path if s3_zarr_path else local_zarr_path}",log_file)
         log_message(f"Batch size: {batch_size}",log_file)
         log_message(f"Total swath files: {len(swath_df)}",log_file)
         log_message(f"Max to process: {n_timesteps}",log_file)
@@ -2514,7 +2514,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                 log_message(f"  Could not read final Zarr store: {e}",log_file)
     
         log_message(f"\nOutputs:",log_file)
-        log_message(f"  Zarr: {s3_zarr_path}",log_file)
+        log_message(f"  Zarr: {s3_zarr_path if s3_zarr_path else local_zarr_path}",log_file)
         if make_plots:
             log_message(f"  Plots: {step2_plots_dir}",log_file)
         if _owns_log:
