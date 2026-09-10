@@ -2020,6 +2020,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     if os.path.exists(local_zarr_path):
         if overwrite:
             shutil.rmtree(local_zarr_path)
+            gc.collect()  # flush any lingering zarr/mmap references before new store allocation
             local_zarr_written = False
         else:
             local_zarr_written = True  # append to it; prevents mode='w' on first batch flush
