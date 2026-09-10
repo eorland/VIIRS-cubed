@@ -1,7 +1,9 @@
 import datetime as dt
-
 import numpy as np
 import xarray as xr
+import subprocess
+import tempfile
+import os
 
 
 def log_message(message, log_file, print_to_console=True, include_timestamp=True):
@@ -14,6 +16,40 @@ def log_message(message, log_file, print_to_console=True, include_timestamp=True
     log_file.flush()
     if print_to_console:
         print(formatted_message)
+
+
+def _append_line_to_s3_log(s3_log_url, message):
+    """
+    Helper function to assist with appending a final line to s3 log file
+    following local directory removal.
+    
+    """
+    timestamp = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{timestamp}] {message}\n"
+
+    # make temp file to hold log contents, then append new line and upload back to S3
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        dl = subprocess.run( # download log to temp path
+            ["aws", "s3", "cp", s3_log_url, tmp_path],
+            capture_output=True, text=True
+        )
+        if dl.returncode != 0:
+            open(tmp_path, 'w').close()
+
+        with open(tmp_path, 'a') as f:
+            f.write(line) # add final line
+
+        # reupload
+        subprocess.run( 
+            ["aws", "s3", "cp", tmp_path, s3_log_url],
+            capture_output=True, text=True
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def compute_fire_persistence_baseline(

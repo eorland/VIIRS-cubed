@@ -1,10 +1,12 @@
 import ast
 import datetime as dt
 import os
+import shutil
+import subprocess
 
 from swath_preprocessing import process_swaths
 from standardizations import standardize_swaths
-from utils import log_message
+from utils import log_message, _append_line_to_s3_log
 
 
 def process_single_fire(
@@ -35,7 +37,7 @@ def process_single_fire(
     copy_to_s3=False,
     s3_prefix=None,
     output_dir='VIIRS-cubed-outputs',
-    remove_local=False,
+    cleanup_local=False,
 
     # --- Persistence parameters (compute_fire_persistence_baseline via standardize_swaths) ---
     add_persistence=False,
@@ -95,8 +97,11 @@ def process_single_fire(
         S3 destination prefix. Required when copy_to_s3=True.
     output_dir : str, optional
         Local base output directory. Default: 'VIIRS-cubed-outputs'.
-    remove_local : bool, optional
-        Delete local files after S3 upload. Requires copy_to_s3=True.
+    cleanup_local : bool, optional
+        Delete local output directory after both steps complete and all logs
+        are uploaded to S3. Requires copy_to_s3=True. Unlike the step-level
+        remove_local, this runs once at the end and deletes files from 
+        both preprocessing and standardization steps. Default: False.
     add_persistence : bool, optional
         Compute fire persistence metrics after gridding. Default: False.
     persistence_fire_mask_col : str or None, optional
@@ -117,8 +122,8 @@ def process_single_fire(
     '''
     if copy_to_s3 and s3_prefix is None:
         raise ValueError("s3_prefix is required when copy_to_s3=True")
-    if remove_local and not copy_to_s3:
-        raise ValueError("remove_local=True requires copy_to_s3=True")
+    if cleanup_local and not copy_to_s3:
+        raise ValueError("cleanup_local=True requires copy_to_s3=True")
     if persistence_fire_mask_col is not None and persistence_suffix is None:
         raise ValueError("persistence_suffix is required when persistence_fire_mask_col is set")
 
@@ -170,7 +175,7 @@ def process_single_fire(
             copy_to_s3=copy_to_s3,
             s3_prefix=s3_prefix,
             output_dir=output_dir,
-            remove_local=remove_local,
+            remove_local=False,
             log_file=wf_log,
         )
 
@@ -202,7 +207,7 @@ def process_single_fire(
             remove_bowtie=remove_bowtie,
             deduplicate_scans=deduplicate_scans,
             output_dir=output_dir,
-            remove_local=remove_local,
+            remove_local=False,
             add_persistence=add_persistence,
             persistence_fire_mask_col=persistence_fire_mask_col,
             persistence_suffix=persistence_suffix,
@@ -212,10 +217,38 @@ def process_single_fire(
         )
 
     finally:
+        base_output_dir = os.path.join(
+            os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS"
+        )
+
         if wf_log is not None:
             log_message("", wf_log, include_timestamp=False)
             log_message(f"Workflow completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                         wf_log, include_timestamp=False)
+
+        if cleanup_local and copy_to_s3:
+            s3_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS"
+            if wf_log is not None:
+                log_message(f"Attempting to remove: {base_output_dir}", wf_log,
+                            include_timestamp=False)
+                wf_log.close()
+                wf_log = None
+                subprocess.run( # upload file before removal
+                    ["aws", "s3", "cp", workflow_log_path,
+                     f"{s3_dest}/Logs/{os.path.basename(workflow_log_path)}"],
+                    capture_output=True, text=True
+                )
+            shutil.rmtree(base_output_dir)
+            if save_workflow_log:
+                _append_line_to_s3_log(
+                    f"{s3_dest}/Logs/{os.path.basename(workflow_log_path)}",
+                    f"Local directory removed successfully: {base_output_dir}"
+                )
+            print(f"\n{'='*60}")
+            print(f"Local files removed: {base_output_dir}")
+            print(f"{'='*60}")
+
+        if wf_log is not None:
             wf_log.close()
             print(f"\n{'='*60}")
             print(f"Workflow log saved: {workflow_log_path}")
@@ -359,10 +392,10 @@ if __name__ == '__main__':
         help="Local base directory for all outputs. Default: 'VIIRS-cubed-outputs'."
     )
     parser.add_argument(
-        "--remove_local",
+        "--cleanup_local",
         action="store_true",
         default=False,
-        help="If set, remove local output files after a successful S3 upload. Requires --copy_to_s3."
+        help="If set, delete the local output directory after both steps complete and logs are uploaded to S3. Requires --copy_to_s3."
     )
     parser.add_argument(
         "--add_persistence",
@@ -409,8 +442,8 @@ if __name__ == '__main__':
 
     if args.copy_to_s3 and args.s3_prefix is None:
         parser.error("--s3_prefix is required when --copy_to_s3 is set.")
-    if args.remove_local and not args.copy_to_s3:
-        parser.error("--remove_local requires --copy_to_s3.")
+    if args.cleanup_local and not args.copy_to_s3:
+        parser.error("--cleanup_local requires --copy_to_s3.")
     if args.persistence_fire_mask_col is not None and args.persistence_suffix is None:
         parser.error("--persistence_suffix is required when --persistence_fire_mask_col is set.")
 
@@ -442,7 +475,7 @@ if __name__ == '__main__':
         copy_to_s3=args.copy_to_s3,
         s3_prefix=args.s3_prefix,
         output_dir=args.output_dir,
-        remove_local=args.remove_local,
+        cleanup_local=args.cleanup_local,
         add_persistence=args.add_persistence,
         persistence_fire_mask_col=args.persistence_fire_mask_col,
         persistence_suffix=args.persistence_suffix,
@@ -471,4 +504,5 @@ if __name__ == '__main__':
     #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
     #     --output_dir 'VIIRS-cubed-outputs' \
     #     --overwrite \
+    #     --cleanup_local \
     #     --save_workflow_log

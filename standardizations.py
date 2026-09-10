@@ -22,10 +22,11 @@ from shapely.geometry import box, Polygon
 import zarr
 from zarr.codecs import BloscCodec
 import shutil
+import subprocess
 import gc
 import fsspec
 
-from utils import log_message, compute_fire_persistence_baseline
+from utils import log_message, compute_fire_persistence_baseline, _append_line_to_s3_log
 
 # Plotting and visualization
 import seaborn as sns
@@ -2334,8 +2335,21 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
                 log_message(f"Appended to S3 ({time.time() - t0:.1f}s)",log_file)
                 if remove_local:
+                    s3_log_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS/Logs/{log_filename}"
+                    log_message(f"Attempting to remove: {base_output_dir}", log_file)
+                    if _owns_log:
+                        log_file.close()
+                        log_file = None
+                        subprocess.run(
+                            ["aws", "s3", "cp", log_path, s3_log_dest],
+                            capture_output=True, text=True
+                        )
                     shutil.rmtree(base_output_dir)
-                    log_message(f"Local files removed: {base_output_dir}",log_file)
+                    if _owns_log:
+                        _append_line_to_s3_log(
+                            s3_log_dest,
+                            f"Local directory removed successfully: {base_output_dir}"
+                        )
             else:
                 # Fresh run — full copy
                 log_message("Copying Zarr store to S3...",log_file)
@@ -2353,9 +2367,22 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                 zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
 
                 log_message(f"Copied to {s3_zarr_path} ({time.time() - t0:.1f}s)",log_file)
-                if remove_local:
+                if remove_local: # same idea as above. this can probably be revised to avoid duplication in the future
+                    s3_log_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS/Logs/{log_filename}"
+                    log_message(f"Local files removed: {base_output_dir}", log_file)
+                    if _owns_log:
+                        log_file.close()
+                        log_file = None
+                        subprocess.run(
+                            ["aws", "s3", "cp", log_path, s3_log_dest],
+                            capture_output=True, text=True
+                        )
                     shutil.rmtree(base_output_dir)
-                    log_message(f"Local files removed: {base_output_dir}",log_file)
+                    if _owns_log:
+                        _append_line_to_s3_log(
+                            s3_log_dest,
+                            f"Local directory removed successfully: {base_output_dir}"
+                        )
 
         else:
             log_message("No new data written — skipping S3 copy",log_file)
@@ -2495,7 +2522,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         log_message(f"\nRun completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",log_file)
 
     finally:
-        if _owns_log:
+        if _owns_log and log_file is not None:
             log_file.close()
 
     if _owns_log:

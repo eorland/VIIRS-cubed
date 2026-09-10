@@ -25,7 +25,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.mpl.gridliner
 
-from utils import log_message
+from utils import log_message, _append_line_to_s3_log
 
 
 def gather_filepaths(bbox, start, end, sensors):
@@ -1316,8 +1316,20 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
             log_message(f"S3 upload complete!", log_file,)
             log_message(f"  S3 location: {s3_dest}/", log_file,)
             if remove_local:
+                log_message(f"Attempting to remove: {base_output_dir}", log_file)
+                if _owns_log:
+                    log_file.close()
+                    log_file = None
+                    subprocess.run(
+                        ["aws", "s3", "cp", log_path, f"{s3_dest}/Logs/{log_filename}"],
+                        capture_output=True, text=True
+                    )
                 shutil.rmtree(base_output_dir)
-                log_message(f"Local files removed: {base_output_dir}", log_file,)
+                if _owns_log:
+                    _append_line_to_s3_log(
+                        f"{s3_dest}/Logs/{log_filename}",
+                        f"Local directory removed successfully: {base_output_dir}"
+                    )
         else:
             log_message(f"S3 upload failed!", log_file,)
             log_message(f"  Error: {result.stderr}", log_file,)
@@ -1358,7 +1370,7 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
         log_message(f"\nLog saved to: {log_path}", log_file,)
     log_message(f"Run completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", log_file,)
 
-    if _owns_log:
+    if _owns_log and log_file is not None:
         log_file.close()
 
     return
