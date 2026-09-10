@@ -2385,7 +2385,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                             f"Local directory removed successfully: {base_output_dir}"
                         )
 
-        else:
+        elif not local_zarr_written: # TODO revisit this b/c I don't think it covers all cases
             log_message("No new data written — skipping S3 copy",log_file)
 
 
