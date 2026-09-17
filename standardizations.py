@@ -1,6 +1,8 @@
 # Core data processing
 import numpy as np
+import io
 import random
+import tempfile
 import time
 import pandas as pd
 import glob
@@ -26,7 +28,9 @@ import subprocess
 import gc
 import fsspec
 
-from utils import log_message, compute_fire_persistence_baseline, _append_line_to_s3_log
+from utils import (log_message, compute_fire_persistence_baseline,
+                   upload_log_to_s3, is_s3_path, file_exists,
+                   load_swath_metadata)
 
 # Plotting and visualization
 import seaborn as sns
@@ -42,111 +46,27 @@ import cartopy.mpl.gridliner
 
 def query_available_swath_data(fire_name, output_dir='VIIRS-cubed-outputs'):
 
-    # ===================================================================
-    # LOCATE STEP 1 OUTPUT FILES
-    # ===================================================================
+    if is_s3_path(output_dir):
+        data_dir = (
+            f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
+            f"/Data/Step1_Compiled_Swaths"
+        )
+    else:
+        data_dir = os.path.join(
+            os.path.abspath(output_dir),
+            f"{fire_name}_Gridded_VIIRS", "Data", "Step1_Compiled_Swaths"
+        )
 
-    # Define paths based on Step 1 naming convention
-    base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
-    data_dir = os.path.join(base_output_dir, "Data", "Step1_Compiled_Swaths")
-    
-    # Check if directory exists
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Step 1 data directory not found: {data_dir}")
-    
-    # Get all NetCDF files in a list
-    swath_files = sorted([
-        os.path.join(data_dir, f) 
-        for f in os.listdir(data_dir) 
-        if f.endswith('_swath.nc')
-    ])
+    swath_df = load_swath_metadata(data_dir)
 
-    print(f"Found {len(swath_files)} swath files in {data_dir}")
+    if len(swath_df) == 0:
+        raise FileNotFoundError(
+            f"No swath metadata found at {data_dir}. "
+            f"Has Step 1 been run for '{fire_name}'?"
+        )
 
-    # Loop through each file and parse metadata to compile into single table
-    swath_metadata = []
-    bad_files = []
+    print(f"Loaded swath metadata: {len(swath_df)} entries from {data_dir}")
     
-    for filepath in swath_files:
-        filename = os.path.basename(filepath)
-        # Expected format: SATELLITE_YYYYMMDD_HHMM_swath.nc
-        parts = filename.replace('_swath.nc', '').split('_')
-        
-        if len(parts) >= 3:
-            satellite = parts[0]
-            date_str = parts[1]
-            time_str = parts[2]
-            
-            # Parse timestamp
-            timestamp = pd.to_datetime(f"{date_str}_{time_str}", format='%Y%m%d_%H%M')
-            
-            try:
-                # Fast metadata extraction using netCDF4 directly (no data loading)
-                with nc4.Dataset(filepath, 'r') as ds:
-                    # Get attributes
-                    avg_scan_angle = ds.getncattr('avg_scan_angle_scene') if 'avg_scan_angle_scene' in ds.ncattrs() else np.nan
-                    daynight = ds.getncattr('daynight') if 'daynight' in ds.ncattrs() else 'Unknown'
-                    overpass_period = ds.getncattr('overpass_period') if 'overpass_period' in ds.ncattrs() else 'Unknown'
-                    
-                    # Original and cropped shapes (stored as attributes)
-                    original_shape = ds.getncattr('original_shape') if 'original_shape' in ds.ncattrs() else [0, 0]
-                    cropped_shape = ds.getncattr('cropped_shape') if 'cropped_shape' in ds.ncattrs() else [0, 0]
-                    
-                    # Get dimension sizes
-                    n_scans = len(ds.dimensions['scan']) if 'scan' in ds.dimensions else 0
-                    n_pixels = len(ds.dimensions['pixel']) if 'pixel' in ds.dimensions else 0
-                    
-                    # Get scan coordinate range for boundary analysis
-                    scan_var = ds.variables['scan'][:]
-                    scan_min = int(scan_var[0])
-                    scan_max = int(scan_var[-1])
-    
-                  
-                swath_metadata.append({
-                    'filepath': filepath,
-                    'filename': filename,
-                    'satellite': satellite,
-                    'timestamp': timestamp,
-                    'date': timestamp.date(),
-                    'time': timestamp.time(),
-                    'avg_scan_angle': avg_scan_angle,
-                    'daynight': daynight,
-                    'overpass_period': overpass_period,
-                    'n_scans': n_scans,
-                    'n_pixels': n_pixels,
-                    'original_scans': int(original_shape[0]),
-                    'original_pixels': int(original_shape[1]),
-                    'scan_min': scan_min,
-                    'scan_max': scan_max,
-                })
-                
-            except Exception as e:
-                # Log the problematic file
-                bad_files.append({
-                    'filepath': filepath,
-                    'filename': filename,
-                    'satellite': satellite,
-                    'timestamp': timestamp,
-                    'error_type': type(e).__name__,
-                    'error_message': str(e)
-                })
-                print(f"  ERROR reading {filename}: {type(e).__name__} - {str(e)}")
-    
-    # Convert to DataFrame for easy filtering/analysis
-    swath_df = pd.DataFrame(swath_metadata)
-    
-    print(f"\nSuccessfully read {len(swath_df)} swath files")
-    
-    if len(bad_files) > 0:
-        print(f"\n{'='*70}")
-        print(f"WARNING: {len(bad_files)} files could not be read!")
-        print(f"{'='*70}")
-        bad_files_df = pd.DataFrame(bad_files)
-        print(bad_files_df[['filename', 'error_type']])
-        print("\nYou may want to delete or re-process these files:")
-        for bf in bad_files:
-            print(f"  {bf['filepath']}")
-
     return swath_df
 
 
@@ -852,6 +772,7 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     
     if verbose:
         print(f"Mapping {satellite} {timestamp} to reference grid...")
+
     
     # ================================================================
     # STEP 2: Create gdf of all swath pixels
@@ -859,8 +780,10 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     
     target_crs = grid_gdf.crs
 
+    t0 = time.time()
     # construct pixels
     swath_gdf = create_viirs_pixel_polygons(swath_ds, target_crs, verbose=verbose)
+    print(f"Polygon creation: {time.time()-t0:.1f}s, {len(swath_gdf)} pixels")
     
     if len(swath_gdf) == 0:
         if verbose:
@@ -877,9 +800,11 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     if verbose:
         print(f"  Calculating spatial intersections...")
 
+    t0 = time.time()
     # compute spatial join - each row represents a unique pixel ~ grid cell match
     # this is the foundation of our mapping df
     joined = gpd.sjoin(swath_gdf, grid_gdf, how='inner', predicate='intersects')
+    print(f"sjoin: {time.time()-t0:.1f}s, {len(joined)} pairs")
     
     if len(joined) == 0:
         if verbose:
@@ -900,8 +825,10 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     pixel_geoms = swath_gdf.loc[joined.index, 'geometry'].values # intersecting pixel geoms
     grid_geoms = grid_gdf.loc[joined['index_right'], 'geometry'].values # corresponding grid geoms
     
+    t0 = time.time()
     # Vectorized intersection and area calculation
     intersections = shapely.intersection(pixel_geoms, grid_geoms)
+    print(f"intersection: {time.time()-t0:.1f}s")
     pixel_overlap_areas_km2 = shapely.area(intersections) / 1e6 # convert to km2 from m
     pixel_areas_km2 = joined['pixel_area_km2_measured'].values # original pixel areas
     grid_cell_area_km2 = grid_gdf.loc[joined['index_right'], 'geometry'].area.values / 1e6 # compute native grid area
@@ -1397,7 +1324,8 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
     # ================================================================
     # STEP 4: Fire mask — max, mode, area-weighted majority
     # ================================================================
-    
+
+    # first check to make sure fire_mask exists - this should never fire (ideally)
     if 'fire_mask' not in mapping_full.columns:
         raise ValueError(
             f"'fire_mask' not found in mapping_full. "
@@ -1405,14 +1333,15 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
             f"Available columns: {list(mapping_full.columns)}"
         )
         
-    # Max fire mask per grid cell
+    # --- Max ---
+    # easiest metric to calculate is the max - just do a groupby 
     fm_max = grouped['fire_mask'].max().reset_index(name='fire_mask_max')
     grid_agg_df = grid_agg_df.merge(fm_max, on='grid_id', how='left')
     
     # --- Mode ---
     # Count occurrences of each fire_mask value per grid cell,
     # then pick the value with the highest count.
-    # sort_index ensures ties go to the lowest value
+    # sort_values ensures ties go to the lowest value
     fm_counts = (
         mapping_full
         .groupby(['grid_id', 'fire_mask'], observed=True)
@@ -1431,7 +1360,7 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
     )
     grid_agg_df = grid_agg_df.merge(fm_mode[['grid_id', 'fire_mask_mode']], on='grid_id', how='left')
     
-    # --- Area-weighted majority ---
+    # --- Area-weighted majority (all pixels) ---
     # Sum intersection area per (grid_id, fire_mask), then pick the
     # fire_mask with the highest total area per grid_id.
     fm_weights = (
@@ -1450,15 +1379,61 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
     )
     grid_agg_df = grid_agg_df.merge(fm_majority[['grid_id', 'fire_mask_area_weighted_majority']], 
                                     on='grid_id', how='left')
+
+    # --- Fire area fraction ---
+    # Fraction of total contributing pixel area that comes from confirmed
+    # fire pixels (fire_mask >= 6, which is an unclassified fire). Denominator is total_intersecting_areas
+    fire_pixels = mapping_full[mapping_full['fire_mask'] >= 6]
+
+    # compute intersecting area of all valid fire pixels
+    if len(fire_pixels) > 0:
+        fire_intersection_area = fire_pixels.groupby(
+            'grid_id', observed=True
+        )['pixel_intersection_area_km2'].sum()
+
+        fire_area_frac = (
+            fire_intersection_area / total_intersecting_areas
+        ).reset_index(name='fire_area_fraction')
+
+        grid_agg_df = grid_agg_df.merge(fire_area_frac, on='grid_id', how='left')
+
+        # --- Area-weighted majority (fire pixels only) ---
+        # Among confirmed fire pixels (fire_mask >= 6), which confidence
+        # class dominates by area? 
+        fm_fire_weights = (
+            fire_pixels
+            .groupby(['grid_id', 'fire_mask'], observed=True)['pixel_intersection_area_km2']
+            .sum()
+            .reset_index(name='_weight')
+        )
+
+        fm_fire_majority = (
+            fm_fire_weights
+            .sort_values(['grid_id', '_weight'], ascending=[True, True])
+            .drop_duplicates(subset='grid_id', keep='last')
+            .rename(columns={'fire_mask': 'fire_mask_area_weighted_majority_fire_pixels'})
+        )
+        grid_agg_df = grid_agg_df.merge(
+            fm_fire_majority[['grid_id', 'fire_mask_area_weighted_majority_fire_pixels']],
+            on='grid_id', how='left'
+        )
+
+    else:
+        grid_agg_df['fire_area_fraction'] = 0.0
+        grid_agg_df['fire_mask_area_weighted_majority_fire_pixels'] = np.nan
+
+    # Cells with no fire pixels get fraction = 0
+    grid_agg_df['fire_area_fraction'] = grid_agg_df['fire_area_fraction'].fillna(0.0)
     
-    # Fire pixel count (fire_mask >= 7)
-    fire_count = mapping_full[mapping_full['fire_mask'] >= 7].groupby(
+    # fire_mask_area_weighted_majority_fire_pixels stays NaN for cells
+    # with no fire pixels — NaN correctly signals "no fire signal present".
+    
+    # Fire pixel count (fire_mask >= 6)
+    fire_count = mapping_full[mapping_full['fire_mask'] >= 6].groupby(
         'grid_id', observed=True
     ).size().reset_index(name='n_fire_pixels')
     grid_agg_df = grid_agg_df.merge(fire_count, on='grid_id', how='left')
-    grid_agg_df['n_fire_pixels'] = (
-        grid_agg_df['n_fire_pixels'].fillna(0).astype(int)
-    )
+    grid_agg_df['n_fire_pixels'] = grid_agg_df['n_fire_pixels'].fillna(0).astype(int)
     
     # ================================================================
     # STEP 4b: Candidate confidence — max, area-weighted majority
@@ -1481,9 +1456,10 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
             )
             grid_agg_df = grid_agg_df.merge(cc_max, on='grid_id', how='left')
             
-            # --- Area-weighted majority ---
-            # Sum intersection area per (grid_id, candidate_confidence), then pick the
-            # candidate_confidence class with the highest total area per grid_id.
+            # --- Area-weighted majority (candidate pixels only) ---
+            # Sum intersection area per (grid_id, candidate_confidence), then
+            # pick the candidate_confidence class with the highest total area
+            # per grid_id.
             cc_weights = (
                 candidates
                 .groupby(['grid_id', 'candidate_confidence'], observed=True)
@@ -1504,7 +1480,26 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
                 cc_majority[['grid_id', 'candidate_confidence_area_weighted_majority']], 
                 on='grid_id', how='left'
             )
+
+            # --- Candidate area fraction ---
+            # Fraction of total contributing pixel area that comes from candidate
+            # pixels (candidate_confidence is not NaN). 
+            # Fraction answers "do candidates dominate this cell?"
+            # Majority answers "what is the dominant candidate signal?"
             
+            # compute the total intersecting candidate area
+            cand_intersection_area = candidates.groupby(
+                'grid_id', observed=True
+            )['pixel_intersection_area_km2'].sum()
+
+            cand_area_frac = (
+                cand_intersection_area / total_intersecting_areas
+            ).reset_index(name='candidate_area_fraction')
+
+            grid_agg_df = grid_agg_df.merge(
+                cand_area_frac, on='grid_id', how='left'
+            )
+
             # Count of candidate pixels per grid cell
             cc_count = cand_grouped.size().reset_index(
                 name='n_candidate_pixels'
@@ -1517,11 +1512,14 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
             grid_agg_df['candidate_confidence_max'] = np.nan
             grid_agg_df['candidate_confidence_area_weighted_majority'] = np.nan
             grid_agg_df['n_candidate_pixels'] = 0
+            grid_agg_df['candidate_area_fraction'] = 0.0
         
         grid_agg_df['n_candidate_pixels'] = (
             grid_agg_df['n_candidate_pixels'].fillna(0).astype(int)
         )
-    
+        grid_agg_df['candidate_area_fraction'] = (
+            grid_agg_df['candidate_area_fraction'].fillna(0.0)
+        )
     # ================================================================
     # STEP 5: Area-weighted mean scan angle (NaN-safe)
     # ================================================================
@@ -1946,8 +1944,8 @@ def _write_persistence_vars(ds_with_persistence, zarr_store, suffix_list):
     """Write only the persistence variables into zarr_store, in-place."""
     _var_templates = [
         'persistence_hours_baseline_{s}', 't_fire_start_{s}',
-        't_fire_end_baseline_{s}',        'n_am_detection_windows_{s}',
-        'n_pm_detection_windows_{s}',     'n_total_detection_windows_{s}',
+        't_fire_end_baseline_{s}',        'n_day_detection_windows_{s}',
+        'n_night_detection_windows_{s}',     'n_total_detection_windows_{s}',
         'dp_ratio_{s}',                   'n_cloud_detection_windows_{s}',
     ]
     z = zarr.open(zarr_store, mode='r+')
@@ -1970,186 +1968,293 @@ def _write_persistence_vars(ds_with_persistence, zarr_store, suffix_list):
 
 def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                        grid_region='conus', grid_resolution=375,
-                       overwrite=False, make_plots=False, copy_to_s3=False,
-                       s3_prefix=None, batch_size=50, grid_pad=10,
+                       overwrite=False, make_plots=False,
+                       batch_size=50, grid_pad=10,
                        remove_bowtie=False, deduplicate_scans=False,
-                       output_dir='VIIRS-cubed-outputs', remove_local=False,
-                       add_persistence=False, persistence_fire_mask_col=None,
-                       persistence_suffix=None, persistence_start_threshold=6,
-                       persistence_end_threshold=6,
+                       output_dir='VIIRS-cubed-outputs',
+                       add_persistence=False, persistence_threshold_col=None,
+                       persistence_suffix=None, persistence_start_threshold=0,
+                       persistence_end_threshold=0, area_fraction_col='candidate_area_fraction',
+                       area_fraction_threshold=0.5,
                        log_file=None):
+    '''
+    Full workflow for loading and aggregating swath data into a regular grid.
 
-    '''Full workflow for loading and aggregating swath data into a regular grid.'''
+    Step 1 outputs are read from output_dir (local or S3). The Zarr datacube
+    is always written locally first, then copied to S3 at the end of the run
+    if output_dir is an S3 URI. This local-buffer approach is faster than
+    writing chunks directly to S3 and provides a fallback if the job crashes
+    before the copy completes.
 
-    if copy_to_s3 and s3_prefix is None:
-        raise ValueError("s3_prefix is required when copy_to_s3=True")
-    if remove_local and not copy_to_s3:
-        raise ValueError("remove_local=True requires copy_to_s3=True")
-    if persistence_fire_mask_col is not None and persistence_suffix is None:
-        raise ValueError("persistence_suffix is required when persistence_fire_mask_col is set")
+    Parameters
+    ----------
+    fire_name : str
+        Fire/region name.
+    bbox : list
+        Bounding box [lon_min, lat_min, lon_max, lat_max].
+    start : str
+        Start date in YYYY-MM-DD format.
+    end : str
+        End date in YYYY-MM-DD format.
+    n_timesteps : int
+        Number of swaths to process. -1 processes all.
+    grid_region : str
+        Reference grid region: 'conus', 'global', or 'custom'.
+    grid_resolution : int
+        Grid cell size in meters.
+    overwrite : bool
+        Reprocess files that already exist.
+    make_plots : bool
+        Generate and save gridded swath plots.
+    batch_size : int
+        Swaths to accumulate before flushing to the local Zarr store.
+    grid_pad : int
+        Extra grid cells of padding around the bounding box.
+    remove_bowtie : bool
+        Remove bowtie-affected pixels before aggregation.
+    deduplicate_scans : bool
+        Deduplicate overlapping scan lines before aggregation.
+    output_dir : str
+        Base directory for all outputs. Accepts a local path or an S3 URI
+        (s3://bucket/prefix/). When an S3 URI is provided, Step 1 swath
+        files are read from S3, the Zarr datacube is buffered locally at
+        ./zarr_buffer/{fire_name}_datacube.zarr, then copied to S3 on
+        completion.
+    add_persistence : bool
+        Compute fire persistence metrics after gridding.
+    persistence_threshold_col : str or None
+        (e.g. 'candidate_confidence_max',
+        'candidate_confidence_area_weighted_majority') with thresholds on the
+        0-3 candidate confidence scale (0=unconfirmed candidate, 1=low,
+        2=nominal, 3=high). If None, defaults to candidate_confidence_max and
+        candidate_confidence_area_weighted_majority.
+    persistence_suffix : str or None
+        Suffix for persistence output variable names.
+    persistence_start_threshold : int
+         Candidate confidence threshold for ignition detection.
+    persistence_end_threshold : int
+        Candidate confidence threshold for sustained detection.
+    area_fraction_col : str, optional
+        Variable in all_data giving the fraction of contributing pixel area
+        occupied by candidates at each (time, y, x). Default
+        'candidate_area_fraction'. Used for persistence calculation only.
+    area_fraction_threshold : float, optional
+        Minimum area fraction required for a timestep to count as a
+        detection. Default 0.5 (candidates must cover >= 50% of the cell's
+        contributing area). Used for persistence calculation only.
 
-    base_output_dir = os.path.join(os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS")
-    step2_plots_dir = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
-    logs_dir = os.path.join(base_output_dir, "Logs")
-    mapping_output_dir = os.path.join(base_output_dir, "Data", "mappings")
-    
+    log_file : file-like or None
+        Open log file handle. If None, a new log is created.
+    '''
+
+    if persistence_threshold_col is not None and persistence_suffix is None:
+        raise ValueError(
+            "persistence_suffix is required when persistence_threshold_col is set"
+        )
+
+    # ===================================================================
+    # RESOLVE PATHS
+    # ===================================================================
+
+    _s3_output = is_s3_path(output_dir)
+
+    if _s3_output:
+        # Step 1 data lives on S3
+        s3_base    = f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
+        s3_zarr_path = f"{s3_base}/Data/{fire_name}_datacube.zarr"
+        fs         = s3fs.S3FileSystem()
+
+        # Local buffer for Zarr writes (fixed path, survives crashes)
+        local_zarr_path = os.path.abspath(
+            os.path.join('zarr_buffer', f"{fire_name}_datacube.zarr")
+        )
+        os.makedirs(os.path.dirname(local_zarr_path), exist_ok=True)
+
+        # Logs are local
+        local_logs_dir = os.path.abspath(
+            os.path.join('zarr_buffer', f"{fire_name}_logs")
+        )
+        os.makedirs(local_logs_dir, exist_ok=True)
+        logs_dir     = local_logs_dir
+        step2_plots_dir   = os.path.join(local_logs_dir, "Step2_Gridded_Swaths")
+        mapping_output_dir = os.path.join(local_logs_dir, "mappings")
+    else:
+        base_output_dir    = os.path.join(
+            os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS"
+        )
+        step2_plots_dir    = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
+        logs_dir           = os.path.join(base_output_dir, "Logs")
+        mapping_output_dir = os.path.join(base_output_dir, "Data", "mappings")
+        local_zarr_path    = os.path.join(
+            base_output_dir, "Data", f"{fire_name}_datacube.zarr"
+        )
+        s3_zarr_path = None
+        fs           = None
+
     for directory in [step2_plots_dir, logs_dir, mapping_output_dir]:
         os.makedirs(directory, exist_ok=True)
-    
-    swath_df = query_available_swath_data(fire_name, output_dir=output_dir)
-    grid_meta = create_reference_grid(region=grid_region, resolution=grid_resolution)
+
+    # ===================================================================
+    # QUERY STEP 1 FILES + BUILD GRID
+    # ===================================================================
+
+    swath_df   = query_available_swath_data(fire_name, output_dir=output_dir)
+    grid_meta  = create_reference_grid(region=grid_region, resolution=grid_resolution)
     fire_extent, grid_gdf = create_fire_grid_extent(bbox, grid_meta, pad=grid_pad)
-    
+
     print(f"\nReference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m")
     print(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']} "
           f"= {fire_extent['n_rows'] * fire_extent['n_cols']:,} cells")
 
     # ===================================================================
-    # ZARR STORE SETUP
+    # LOCAL ZARR STORE SETUP
     # ===================================================================
-    
-    local_zarr_path = os.path.join(base_output_dir, "Data", f"{fire_name}_datacube.zarr")
-    # initialize fs and s3 path variables
-    fs = None
-    s3_zarr_path = None
-    if s3_prefix:
-        fs = s3fs.S3FileSystem()
-        s3_zarr_path = f"{s3_prefix}{fire_name}_Gridded_VIIRS/Data/{fire_name}_datacube.zarr"
-    
-    # Handle existing local Zarr: remove if overwriting, otherwise append new timesteps to it
+
     if os.path.exists(local_zarr_path):
         if overwrite:
             shutil.rmtree(local_zarr_path)
-            gc.collect()  # flush any lingering zarr/mmap references before new store allocation
+            gc.collect()
             local_zarr_written = False
         else:
-            local_zarr_written = True  # append to it; prevents mode='w' on first batch flush
+            local_zarr_written = True
     else:
         local_zarr_written = False
 
-    # Populate existing_times for per-swath skip logic
+    # Populate existing_times for skip logic
+    # When output_dir is S3, truth is the S3 store (if it exists).
+    # When output_dir is local, truth is the local store (if it exists).
     existing_times = set()
 
-    if s3_zarr_path and fs.exists(s3_zarr_path) and not overwrite:
-        # S3 is the reference copy — read existing timesteps from S3 Zarr
+    if _s3_output and fs.exists(s3_zarr_path) and not overwrite:
         try:
-            store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+            store      = s3fs.S3Map(root=s3_zarr_path, s3=fs)
             existing_ds = xr.open_zarr(store)
             existing_times = set(pd.DatetimeIndex(existing_ds['time'].values))
             existing_ds.close()
-            print(f"Existing S3 Zarr store found with {len(existing_times)} timesteps")
+            print(f"Existing S3 Zarr store: {len(existing_times)} timesteps")
         except Exception as e:
             print(f"Could not read existing S3 Zarr store: {e}")
     elif local_zarr_written:
-        # Local is the reference copy — read existing timesteps from local Zarr
         try:
             local_ds = xr.open_zarr(local_zarr_path)
             existing_times = set(pd.DatetimeIndex(local_ds['time'].values))
             local_ds.close()
-            print(f"Existing local Zarr store found with {len(existing_times)} timesteps")
+            print(f"Existing local Zarr store: {len(existing_times)} timesteps")
         except Exception as e:
             print(f"Could not read existing local Zarr store: {e}")
 
-    existing_s3_store = s3_zarr_path is not None and len(existing_times) > 0 and not overwrite
+    # ===================================================================
+    # LOGGING SETUP
+    # ===================================================================
 
     run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
-    log_path = os.path.join(logs_dir, log_filename)
+    log_filename  = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
+    log_path      = os.path.join(logs_dir, log_filename)
 
     _owns_log = log_file is None
     if _owns_log:
         log_file = open(log_path, 'w')
 
     try:
+        log_message("=" * 70,                             log_file, include_timestamp=False)
+        log_message("STEP 2: SWATH-TO-GRID PROCESSING LOG", log_file, include_timestamp=False)
+        log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    log_file, include_timestamp=False)
+        log_message("=" * 70,                             log_file, include_timestamp=False)
+        log_message(f"Fire name:      {fire_name}",       log_file)
+        log_message(f"BBOX:           {bbox}",            log_file)
+        log_message(f"Date range:     {start} to {end}",  log_file)
+        log_message(f"Reference grid: EPSG:{grid_meta['crs_epsg']}, "
+                    f"{grid_meta['resolution_m']}m",      log_file)
+        log_message(f"Fire extent:    {fire_extent['n_rows']}×{fire_extent['n_cols']}",
+                    log_file)
+        log_message(f"Output dir:     {output_dir}",      log_file)
+        log_message(f"Local Zarr:     {local_zarr_path}", log_file)
+        if _s3_output:
+            log_message(f"S3 Zarr:    {s3_zarr_path}",   log_file)
+        log_message(f"Batch size:     {batch_size}",      log_file)
+        log_message(f"Total swath files: {len(swath_df)}", log_file)
+        log_message(f"Max to process: {n_timesteps}",     log_file)
+        log_message(f"Overwrite:      {overwrite}",       log_file)
+        log_message(f"Make plots:     {make_plots}",      log_file)
+        log_message(f"Existing timesteps: {len(existing_times)}", log_file)
+        log_message("", log_file)
 
-        log_message("=" * 70, log_file, include_timestamp=False)
-        log_message("STEP 2: SWATH-TO-GRID PROCESSING LOG",log_file, include_timestamp=False)
-        log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", log_file,
-                    include_timestamp=False)
-        log_message("=" * 70, log_file, include_timestamp=False)
-        log_message(f"Fire name: {fire_name}", log_file)
-        log_message(f"BBOX: {bbox}", log_file)
-        log_message(f"Date range: {start} to {end}", log_file)
-        log_message(f"Reference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m",log_file)
-        log_message(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']}",log_file)
-        log_message(f"Zarr path: {s3_zarr_path if s3_zarr_path else local_zarr_path}",log_file)
-        log_message(f"Batch size: {batch_size}",log_file)
-        log_message(f"Total swath files: {len(swath_df)}",log_file)
-        log_message(f"Max to process: {n_timesteps}",log_file)
-        log_message(f"Overwrite: {overwrite}",log_file)
-        log_message(f"Make plots: {make_plots}",log_file)
-        log_message(f"Existing timesteps: {len(existing_times)}",log_file)
-        log_message("",log_file)
-    
         # ===================================================================
         # PROCESS ALL SWATHS
         # ===================================================================
-    
+
         log_message(f"{'=' * 70}", log_file, include_timestamp=False)
-        log_message(f"PROCESSING {min(n_timesteps, len(swath_df))} SWATHS",
-                    log_file, include_timestamp=False)
-        log_message(f"{'=' * 70}",log_file, include_timestamp=False)
-        log_message("",log_file)
-    
-        processed_count = 0
-        skipped_count = 0
+        # log_message(f"PROCESSING {len(swaths_to_process)} SWATHS",
+        #             log_file, include_timestamp=False)
+        log_message(f"{'=' * 70}", log_file, include_timestamp=False)
+        log_message("", log_file)
+
+        processed_count      = 0
+        skipped_count        = 0
         already_exists_count = 0
-        error_count = 0
+        error_count          = 0
         all_cleaning_reports = []
-    
-        # Batched Zarr write accumulator
-        pending_datasets = []
-        pending_metadata = []  # track what's in the batch for logging
-    
-        # Timing accumulators
-        timing_records = []
-        
-        swaths_to_process = swath_df.iloc[:n_timesteps]
+        pending_datasets     = []
+        pending_metadata     = []
+        timing_records       = []
+
+        swaths_to_process = swath_df if n_timesteps == -1 else swath_df.iloc[:n_timesteps]
+        log_message(f"PROCESSING {len(swaths_to_process)} SWATHS",
+                    log_file, include_timestamp=False)
         pbar = tqdm(swaths_to_process.iterrows(), total=len(swaths_to_process),
                     desc="Gridding swaths", unit="swath")
-    
+
         for idx, swath_info in pbar:
-            
-            sat = swath_info['satellite']
-            timestamp = swath_info['timestamp']
-            filepath = swath_info['filepath']
+
+            sat            = swath_info['satellite']
+            timestamp      = swath_info['timestamp']
+            filepath       = swath_info['filepath']
             file_timestamp = timestamp.strftime('%Y%m%d_%H%M')
-            
-            pbar.set_description(f"Gridding {sat} {timestamp.strftime('%Y-%m-%d %H:%M')}")
-            
-            # --- Check if already in Zarr ---
+
+            pbar.set_description(
+                f"Gridding {sat} {timestamp.strftime('%Y-%m-%d %H:%M')}"
+            )
+
             if not overwrite and pd.Timestamp(timestamp) in existing_times:
                 already_exists_count += 1
-                log_message(f"Skipping {sat}_{file_timestamp} — already in Zarr",log_file,
-                            print_to_console=False)
+                log_message(f"Skipping {sat}_{file_timestamp} — already in Zarr",
+                            log_file, print_to_console=False)
                 pbar.set_postfix({
                     'done': processed_count, 'exists': already_exists_count,
-                    'skip': skipped_count, 'err': error_count,
-                    'batch': len(pending_datasets)
+                    'skip': skipped_count,   'err':    error_count,
+                    'batch': len(pending_datasets),
                 })
                 continue
-            
-            # --- Check if plot exists ---
+
             plot_filename = f"{sat}_{file_timestamp}_gridded.png"
-            plot_output_path = os.path.join(step2_plots_dir, plot_filename)
-            plot_exists = os.path.exists(plot_output_path) if make_plots else False
-            
+            if is_s3_path(output_dir):
+                plot_output_path = f"{s3_base}/Plots/Step2_Gridded_Swaths/{plot_filename}"
+                plot_exists = file_exists(plot_output_path) if make_plots else False
+            else:
+                plot_output_path = os.path.join(step2_plots_dir, plot_filename)
+                plot_exists = os.path.exists(plot_output_path) if make_plots else False
+
             t_total_start = time.time()
-            timing = {'filename': f"{sat}_{file_timestamp}"}
-            
+            timing        = {'filename': f"{sat}_{file_timestamp}"}
+
             try:
-                # ---- Load swath ----
+                # Load swath — xr.open_dataset works for both local and S3
+                # paths when s3fs is installed
                 t0 = time.time()
-                swath_ds = xr.open_dataset(filepath)
+                if is_s3_path(filepath):
+                    fs_swath = s3fs.S3FileSystem()
+                    swath_ds = xr.open_dataset(fs_swath.open(filepath, 'rb'), engine='h5netcdf')
+                else:
+                    swath_ds = xr.open_dataset(filepath)
                 timing['t_load'] = time.time() - t0
-                
-                # ---- Map to grid ----
+
                 t0 = time.time()
                 mapping_df, swath_gdf = map_swath_to_reference_grid(
                     swath_ds, grid_gdf, verbose=False
                 )
                 timing['t_map'] = time.time() - t0
-                
+
                 if len(mapping_df) == 0:
                     skipped_count += 1
                     log_message(f"Skipping {sat}_{file_timestamp} — no valid mappings",
@@ -2158,72 +2263,100 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     del mapping_df, swath_gdf
                     pbar.set_postfix({
                         'done': processed_count, 'exists': already_exists_count,
-                        'skip': skipped_count, 'err': error_count,
-                        'batch': len(pending_datasets)
+                        'skip': skipped_count,   'err':    error_count,
+                        'batch': len(pending_datasets),
                     })
                     continue
-                
-                # ---- Clean (optional)----
+
                 if remove_bowtie or deduplicate_scans:
                     t0 = time.time()
-                    mapping_df, report = clean_swath_mapping(mapping_df, swath_gdf, remove_bowtie=remove_bowtie,
-                                                             deduplicate_scans=deduplicate_scans, verbose=False)
+                    mapping_df, report = clean_swath_mapping(
+                        mapping_df, swath_gdf,
+                        remove_bowtie=remove_bowtie,
+                        deduplicate_scans=deduplicate_scans,
+                        verbose=False,
+                    )
                     timing['t_clean'] = time.time() - t0
-                    
-                    report['filename'] = f"{sat}_{file_timestamp}"
-                    report['satellite'] = sat
-                    report['timestamp'] = str(timestamp)
+                    report.update({
+                        'filename':  f"{sat}_{file_timestamp}",
+                        'satellite': sat,
+                        'timestamp': str(timestamp),
+                    })
                     all_cleaning_reports.append(report)
-                
+
                 if len(mapping_df) == 0:
                     skipped_count += 1
-                    log_message(f"Skipping {sat}_{file_timestamp} — no pixels after cleaning",
-                                log_file, print_to_console=False)
+                    log_message(
+                        f"Skipping {sat}_{file_timestamp} — no pixels after cleaning",
+                        log_file, print_to_console=False
+                    )
                     swath_ds.close()
                     pbar.set_postfix({
                         'done': processed_count, 'exists': already_exists_count,
-                        'skip': skipped_count, 'err': error_count,
-                        'batch': len(pending_datasets)
+                        'skip': skipped_count,   'err':    error_count,
+                        'batch': len(pending_datasets),
                     })
                     continue
-    
-                # ---- Save mapping ----
+
                 t0 = time.time()
                 mapping_df.to_parquet(
-                    os.path.join(mapping_output_dir, f"{sat}_{file_timestamp}_mapping.parquet"),
-                    index=False
+                    os.path.join(
+                        mapping_output_dir,
+                        f"{sat}_{file_timestamp}_mapping.parquet"
+                    ),
+                    index=False,
                 )
                 timing['t_save_mapping'] = time.time() - t0
-                
-                # ---- Aggregate ----
+
                 t0 = time.time()
-                grid_agg_df = aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=False)
+                grid_agg_df = aggregate_pixels_to_grid(
+                    mapping_df, swath_gdf, verbose=False
+                )
                 timing['t_aggregate'] = time.time() - t0
-                
-                # ---- Convert to xarray ----
+
                 t0 = time.time()
-                ds = grid_agg_to_xarray(grid_agg_df, fire_extent, grid_meta, swath_ds,
-                                        test=True, verbose=False)
+                ds = grid_agg_to_xarray(
+                    grid_agg_df, fire_extent, grid_meta, swath_ds,
+                    test=True, verbose=False
+                )
                 timing['t_to_xarray'] = time.time() - t0
-                
+
                 timing['t_total'] = time.time() - t_total_start
                 timing_records.append(timing)
-                
-                # ---- Accumulate for batched Zarr write ----
+
                 pending_datasets.append(ds)
                 pending_metadata.append(f"{sat}_{file_timestamp}")
-                
-                log_message(f"Processed: {sat}_{file_timestamp} ({timing['t_total']:.1f}s)",
-                            log_file, print_to_console=False)
-                
-                # ---- Save plot (separate from data pipeline) ----
+
+                log_message(
+                    f"Processed: {sat}_{file_timestamp} ({timing['t_total']:.1f}s)",
+                    log_file, print_to_console=False
+                )
+
                 if make_plots and (overwrite or not plot_exists):
                     try:
-                        plot_gridded_swath(
-                            ds.isel(time=0), swath_ds, grid_meta,
-                            save_path=plot_output_path
-                        )
-                        log_message(f"Plotted: {plot_filename}",log_file, print_to_console=False)
+                        if is_s3_path(output_dir):
+                            # Save to temp file, upload to S3, then delete
+                            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                tmp_plot_path = tmp.name
+                            try:
+                                plot_gridded_swath(
+                                    ds.isel(time=0), swath_ds, grid_meta,
+                                    save_path=tmp_plot_path,
+                                )
+                                fs_plot = s3fs.S3FileSystem()
+                                fs_plot.put(tmp_plot_path, plot_output_path)
+                                log_message(f"Plotted (S3): {plot_filename}",
+                                            log_file, print_to_console=False)
+                            finally:
+                                if os.path.exists(tmp_plot_path):
+                                    os.remove(tmp_plot_path)
+                        else:
+                            plot_gridded_swath(
+                                ds.isel(time=0), swath_ds, grid_meta,
+                                save_path=plot_output_path,
+                            )
+                            log_message(f"Plotted: {plot_filename}",
+                                        log_file, print_to_console=False)
                     except Exception as plot_err:
                         log_message(
                             f"PLOT ERROR {sat}_{file_timestamp}: "
@@ -2233,31 +2366,34 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     finally:
                         plt.close('all')
                         gc.collect()
-                
+
                 swath_ds.close()
-                # del mapping_df, swath_gdf, cleaned_df, grid_agg_df
                 processed_count += 1
-                
-                # ---- Flush batch to Zarr if full ----
+
+                # Flush batch to local Zarr if full
                 if len(pending_datasets) >= batch_size:
-                    t0 = time.time()
+                    t0       = time.time()
                     batch_ds = xr.concat(pending_datasets, dim='time')
                     t_concat = time.time() - t0
-                    
+
                     t1 = time.time()
                     if not local_zarr_written:
                         encoding = get_zarr_encoding(batch_ds, fire_extent)
                         batch_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
                         local_zarr_written = True
-                        log_message(f"Created local Zarr store with {len(pending_datasets)} timesteps "
-                                    f"(concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
-                                    log_file, print_to_console=True)
+                        log_message(
+                            f"Created local Zarr with {len(pending_datasets)} timesteps "
+                            f"(concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
+                            log_file, print_to_console=True
+                        )
                     else:
                         batch_ds.to_zarr(local_zarr_path, mode='a', append_dim='time')
-                        log_message(f"Appended batch of {len(pending_datasets)} timesteps "
-                                    f"to local Zarr (concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
-                                    log_file, print_to_console=True)
-                    
+                        log_message(
+                            f"Appended batch of {len(pending_datasets)} timesteps "
+                            f"(concat={t_concat:.1f}s, write={time.time()-t1:.1f}s)",
+                            log_file, print_to_console=True
+                        )
+
                     for d in pending_datasets:
                         d.close()
                     batch_ds.close()
@@ -2265,49 +2401,55 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     pending_datasets = []
                     pending_metadata = []
                     gc.collect()
-                
+
                 pbar.set_postfix({
-                    'done': processed_count, 'exists': already_exists_count,
-                    'skip': skipped_count, 'err': error_count,
-                    'batch': len(pending_datasets)
+                    'done':  processed_count,
+                    'exists': already_exists_count,
+                    'skip':  skipped_count,
+                    'err':   error_count,
+                    'batch': len(pending_datasets),
                 })
-    
+
             except Exception as e:
                 error_count += 1
                 timing['t_total'] = time.time() - t_total_start
-                timing['error'] = f"{type(e).__name__}: {str(e)}"
+                timing['error']   = f"{type(e).__name__}: {str(e)}"
                 timing_records.append(timing)
-                log_message(f"ERROR {sat}_{file_timestamp}: {type(e).__name__} - {str(e)}",
-                            log_file, print_to_console=True)
+                log_message(
+                    f"ERROR {sat}_{file_timestamp}: {type(e).__name__} - {str(e)}",
+                    log_file, print_to_console=True
+                )
                 pbar.set_postfix({
-                    'done': processed_count, 'exists': already_exists_count,
-                    'skip': skipped_count, 'err': error_count,
-                    'batch': len(pending_datasets)
+                    'done':  processed_count,
+                    'exists': already_exists_count,
+                    'skip':  skipped_count,
+                    'err':   error_count,
+                    'batch': len(pending_datasets),
                 })
                 continue
-    
+
         pbar.close()
-        
+
         # ===================================================================
-        # FLUSH REMAINING BATCH
+        # FLUSH REMAINING BATCH TO LOCAL ZARR
         # ===================================================================
-    
-        if len(pending_datasets) > 0:
-            log_message(f"\nFlushing final batch of {len(pending_datasets)} timesteps...",
-                       log_file)
-            
-            t0 = time.time()
+
+        if pending_datasets:
+            log_message(
+                f"\nFlushing final batch of {len(pending_datasets)} timesteps...",
+                log_file
+            )
+            t0       = time.time()
             batch_ds = xr.concat(pending_datasets, dim='time')
-            
+
             if not local_zarr_written:
                 encoding = get_zarr_encoding(batch_ds, fire_extent)
                 batch_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
                 local_zarr_written = True
             else:
                 batch_ds.to_zarr(local_zarr_path, mode='a', append_dim='time')
-            
-            t_write = time.time() - t0
-            log_message(f"Final batch written ({t_write:.1f}s)",log_file)
+
+            log_message(f"Final batch written ({time.time() - t0:.1f}s)", log_file)
 
             for d in pending_datasets:
                 d.close()
@@ -2316,219 +2458,199 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
             pending_datasets = []
             gc.collect()
 
-
         # ===================================================================
-        # COPY LOCAL ZARR TO S3
+        # COPY LOCAL ZARR TO S3 (only when output_dir is S3)
         # ===================================================================
-        
-        if local_zarr_written and copy_to_s3:
-            if existing_s3_store:
-                # Resume — append only new timesteps
-                log_message("Appending new timesteps to existing S3 store...",log_file)
-                t0 = time.time()
-                
-                local_ds = xr.open_zarr(local_zarr_path)
-                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
-                local_ds.to_zarr(store, mode='a', append_dim='time')
-                local_ds.close()
-                
-                zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
 
-                log_message(f"Appended to S3 ({time.time() - t0:.1f}s)",log_file)
-                if remove_local:
-                    s3_log_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS/Logs/{log_filename}"
-                    log_message(f"Attempting to remove: {base_output_dir}", log_file)
-                    if _owns_log:
-                        log_file.close()
-                        log_file = None
-                        subprocess.run(
-                            ["aws", "s3", "cp", log_path, s3_log_dest],
-                            capture_output=True, text=True
-                        )
-                    shutil.rmtree(base_output_dir)
-                    if _owns_log:
-                        _append_line_to_s3_log(
-                            s3_log_dest,
-                            f"Local directory removed successfully: {base_output_dir}"
-                        )
-            else:
-                # Fresh run — full copy
-                log_message("Copying Zarr store to S3...",log_file)
-                t0 = time.time()
+        if local_zarr_written and _s3_output:
+            log_message(f"\nCopying local Zarr to S3: {s3_zarr_path}", log_file)
+            t0 = time.time()
 
-                if fs.exists(s3_zarr_path):
+            if fs.exists(s3_zarr_path):
+                if overwrite:
+                    # Full overwrite — remove existing S3 store first
                     fs.rm(s3_zarr_path, recursive=True)
-
+                    local_ds = xr.open_zarr(local_zarr_path)
+                    store    = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                    encoding = get_zarr_encoding(local_ds, fire_extent)
+                    local_ds.to_zarr(store, mode='w', encoding=encoding)
+                    local_ds.close()
+                else:
+                    # Append only new timesteps to existing S3 store
+                    local_ds = xr.open_zarr(local_zarr_path)
+                    # Filter to only the timesteps we just processed
+                    new_times = [
+                        t for t in pd.DatetimeIndex(local_ds['time'].values)
+                        if t not in existing_times
+                    ]
+                    if new_times:
+                        new_ds = local_ds.sel(time=new_times)
+                        store  = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                        new_ds.to_zarr(store, mode='a', append_dim='time')
+                    local_ds.close()
+            else:
+                # No existing S3 store — full write
                 local_ds = xr.open_zarr(local_zarr_path)
-                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                store    = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                 encoding = get_zarr_encoding(local_ds, fire_extent)
                 local_ds.to_zarr(store, mode='w', encoding=encoding)
                 local_ds.close()
 
-                zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
+            zarr.consolidate_metadata(fs.get_mapper(s3_zarr_path))
+            log_message(f"S3 copy complete ({time.time() - t0:.1f}s)", log_file)
 
-                log_message(f"Copied to {s3_zarr_path} ({time.time() - t0:.1f}s)",log_file)
-                if remove_local: # same idea as above. this can probably be revised to avoid duplication in the future
-                    s3_log_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS/Logs/{log_filename}"
-                    log_message(f"Local files removed: {base_output_dir}", log_file)
-                    if _owns_log:
-                        log_file.close()
-                        log_file = None
-                        subprocess.run(
-                            ["aws", "s3", "cp", log_path, s3_log_dest],
-                            capture_output=True, text=True
-                        )
-                    shutil.rmtree(base_output_dir)
-                    if _owns_log:
-                        _append_line_to_s3_log(
-                            s3_log_dest,
-                            f"Local directory removed successfully: {base_output_dir}"
-                        )
-
-        elif not local_zarr_written: # TODO revisit this b/c I don't think it covers all cases
-            log_message("No new data written — skipping S3 copy",log_file)
-
+        elif not local_zarr_written:
+            log_message("No new data written — skipping S3 copy", log_file)
 
         # ===================================================================
         # PERSISTENCE CALCULATION
         # ===================================================================
 
         if add_persistence:
-            if persistence_fire_mask_col is None:
+            if persistence_threshold_col is None:
                 _suffixes = ['max', 'aw']
-                _cols = ['fire_mask_max', 'fire_mask_area_weighted_majority']
+                _cols     = ['candidate_confidence_max',
+                             'candidate_confidence_area_weighted_majority']
             else:
                 _suffixes = [persistence_suffix]
-                _cols = [persistence_fire_mask_col]
+                _cols     = [persistence_threshold_col]
 
             if not local_zarr_written:
-                log_message("Skipping persistence — no Zarr store was written this run.", log_file)
-
-            elif copy_to_s3:
-                # S3 is truth — compute from the full S3 store (all timesteps present after append)
-                log_message("Computing fire persistence metrics from S3 store...", log_file)
+                log_message(
+                    "Skipping persistence — no Zarr store was written this run.",
+                    log_file
+                )
+            elif _s3_output:
+                log_message("Computing persistence from S3 store...", log_file)
                 s3_store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                 all_data = xr.open_zarr(s3_store)
                 for col, suf in zip(_cols, _suffixes):
                     all_data = compute_fire_persistence_baseline(
                         all_data, col, suf,
-                        start_fire_mask_value=persistence_start_threshold,
-                        end_fire_mask_value=persistence_end_threshold,
+                        start_value=persistence_start_threshold,
+                        end_value=persistence_end_threshold,
+                        area_fraction_col=area_fraction_col,
+                        area_fraction_threshold=area_fraction_threshold,
                     )
                 _write_persistence_vars(all_data, s3_store, _suffixes)
                 all_data.close()
                 log_message("Persistence metrics written to S3 Zarr.", log_file)
-
-                # Mirror full S3 store (including persistence) to local if local was kept
-                if not remove_local:
-                    log_message("Mirroring full S3 store to local Zarr...", log_file)
-                    full_ds = xr.open_zarr(s3_store)
-                    encoding = get_zarr_encoding(full_ds, fire_extent)
-                    full_ds.to_zarr(local_zarr_path, mode='w', encoding=encoding)
-                    full_ds.close()
-                    log_message("Local Zarr updated from S3.", log_file)
-
             else:
-                # Local is truth
-                if existing_s3_store:
-                    log_message(
-                        "WARNING: Skipping persistence — copy_to_s3=False but S3 has prior data "
-                        "this local run is unaware of. Re-run with copy_to_s3=True to compute "
-                        "persistence over the full accumulated dataset.",
-                        log_file
+                log_message("Computing persistence from local Zarr...", log_file)
+                all_data = xr.open_zarr(local_zarr_path)
+                for col, suf in zip(_cols, _suffixes):
+                    all_data = compute_fire_persistence_baseline(
+                        all_data, col, suf,
+                        start_value=persistence_start_threshold,
+                        end_value=persistence_end_threshold,
+                        area_fraction_col=area_fraction_col,
+                        area_fraction_threshold=area_fraction_threshold,
                     )
-                else:
-                    log_message("Computing fire persistence metrics from local Zarr...", log_file)
-                    all_data = xr.open_zarr(local_zarr_path)
-                    for col, suf in zip(_cols, _suffixes):
-                        all_data = compute_fire_persistence_baseline(
-                            all_data, col, suf,
-                            start_fire_mask_value=persistence_start_threshold,
-                            end_fire_mask_value=persistence_end_threshold,
-                        )
-                    _write_persistence_vars(all_data, local_zarr_path, _suffixes)
-                    all_data.close()
-                    log_message("Persistence metrics written to local Zarr.", log_file)
-
+                _write_persistence_vars(all_data, local_zarr_path, _suffixes)
+                all_data.close()
+                log_message("Persistence metrics written to local Zarr.", log_file)
 
         # ===================================================================
         # SUMMARY
         # ===================================================================
-    
-        log_message(f"\n{'=' * 70}", log_file, include_timestamp=False)
-        log_message("PROCESSING COMPLETE", log_file, include_timestamp=False)
-        log_message(f"{'=' * 70}", log_file, include_timestamp=False)
-        log_message(f"  Successfully processed: {processed_count}", log_file)
-        log_message(f"  Already existed (skipped): {already_exists_count}", log_file)
-        log_message(f"  Skipped (no data/empty): {skipped_count}", log_file)
-        log_message(f"  Errors: {error_count}", log_file)
-        log_message(f"  Total: {processed_count + already_exists_count + skipped_count + error_count}",
-                   log_file)
-    
-        # Cleaning summary
-        if len(all_cleaning_reports) > 0:
+
+        log_message(f"\n{'=' * 70}",      log_file, include_timestamp=False)
+        log_message("PROCESSING COMPLETE", log_file)
+        log_message(f"{'=' * 70}",        log_file, include_timestamp=False)
+        log_message(f"  Successfully processed:    {processed_count}",       log_file)
+        log_message(f"  Already existed (skipped): {already_exists_count}",  log_file)
+        log_message(f"  Skipped (no data/empty):   {skipped_count}",         log_file)
+        log_message(f"  Errors:                    {error_count}",           log_file)
+        log_message(
+            f"  Total: "
+            f"{processed_count + already_exists_count + skipped_count + error_count}",
+            log_file
+        )
+
+        if all_cleaning_reports:
             reports_df = pd.DataFrame(all_cleaning_reports)
-            
-            log_message(f"\n  Cleaning statistics across {len(reports_df)} swaths:", log_file)
-            log_message(f"    Mean bowtie removed: "
-                        f"{reports_df.get('bowtie_removed', pd.Series([0])).mean():.1f}",log_file)
-            log_message(f"    Mean dedup removed: "
-                        f"{reports_df.get('dedup_removed', pd.Series([0])).mean():.1f}",log_file)
-            log_message(f"    Mean % removed: {reports_df['pct_removed'].mean():.1f}%",log_file)
-            log_message(f"    Max % removed: {reports_df['pct_removed'].max():.1f}%",log_file)
-    
-        # Timing summary
-        if len(timing_records) > 0:
-            timing_df = pd.DataFrame(timing_records)
-            if 'error' in timing_df.columns:
-                completed = timing_df[timing_df['error'].isna()].copy()
-            else:
-                completed = timing_df.copy()
-            
+            log_message(
+                f"\n  Cleaning statistics across {len(reports_df)} swaths:", log_file
+            )
+            log_message(
+                f"    Mean bowtie removed: "
+                f"{reports_df.get('bowtie_removed', pd.Series([0])).mean():.1f}",
+                log_file
+            )
+            log_message(
+                f"    Mean dedup removed: "
+                f"{reports_df.get('dedup_removed', pd.Series([0])).mean():.1f}",
+                log_file
+            )
+            log_message(f"    Mean % removed: {reports_df['pct_removed'].mean():.1f}%",
+                        log_file)
+            log_message(f"    Max % removed:  {reports_df['pct_removed'].max():.1f}%",
+                        log_file)
+
+        if timing_records:
+            timing_df  = pd.DataFrame(timing_records)
+            completed  = timing_df[timing_df.get('error', pd.Series([None] * len(timing_df))).isna()].copy()
             if len(completed) > 0:
-                step_cols = ['t_load', 't_map', 't_clean', 't_save_mapping', 't_aggregate', 't_to_xarray']
-                available_steps = [c for c in step_cols if c in completed.columns]
-                
-                log_message(f"\n  Timing (excluding Zarr writes):",log_file)
-                for col in available_steps:
+                step_cols = [
+                    't_load', 't_map', 't_clean',
+                    't_save_mapping', 't_aggregate', 't_to_xarray'
+                ]
+                available = [c for c in step_cols if c in completed.columns]
+                log_message("\n  Timing (excluding Zarr writes):", log_file)
+                for col in available:
                     vals = completed[col]
-                    log_message(f"    {col}: mean={vals.mean():.2f}s, total={vals.sum():.1f}s",
-                               log_file)
-                
-                t_processing = sum(completed[c].sum() for c in available_steps)
-                log_message(f"    Processing total: {t_processing:.1f}s ({t_processing/60:.1f} min)",
-                           log_file)
-    
-        # Zarr store summary
-        if (existing_s3_store or local_zarr_written) and s3_zarr_path:
-            try:
-                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
-                final_ds = xr.open_zarr(store)
-                log_message(f"\n  Zarr datacube summary:",log_file)
-                log_message(f"    Path: {s3_zarr_path}",log_file)
-                log_message(f"    Time steps: {final_ds.sizes['time']}",log_file)
-                log_message(f"    Spatial dims: y={final_ds.sizes['y']}, x={final_ds.sizes['x']}",log_file)
-                log_message(f"    Variables: {len(final_ds.data_vars)}",log_file)
-                log_message(f"    Time range: {final_ds.time.values[0]} to {final_ds.time.values[-1]}",log_file)
-                final_ds.close()
-            except Exception as e:
-                log_message(f"  Could not read final Zarr store: {e}",log_file)
-    
-        log_message(f"\nOutputs:",log_file)
-        log_message(f"  Zarr: {s3_zarr_path if s3_zarr_path else local_zarr_path}",log_file)
+                    log_message(
+                        f"    {col}: mean={vals.mean():.2f}s, total={vals.sum():.1f}s",
+                        log_file
+                    )
+                t_proc = sum(completed[c].sum() for c in available)
+                log_message(
+                    f"    Processing total: {t_proc:.1f}s ({t_proc/60:.1f} min)",
+                    log_file
+                )
+
+        zarr_summary_path = s3_zarr_path if _s3_output else local_zarr_path
+        try:
+            if _s3_output:
+                final_ds = xr.open_zarr(s3fs.S3Map(root=s3_zarr_path, s3=fs))
+            else:
+                final_ds = xr.open_zarr(local_zarr_path)
+            log_message(f"\n  Zarr datacube summary:",                       log_file)
+            log_message(f"    Path:       {zarr_summary_path}",              log_file)
+            log_message(f"    Time steps: {final_ds.sizes['time']}",         log_file)
+            log_message(f"    Spatial:    y={final_ds.sizes['y']}, "
+                        f"x={final_ds.sizes['x']}",                          log_file)
+            log_message(f"    Variables:  {len(final_ds.data_vars)}",        log_file)
+            log_message(
+                f"    Time range: {final_ds.time.values[0]} to "
+                f"{final_ds.time.values[-1]}",                               log_file
+            )
+            final_ds.close()
+        except Exception as e:
+            log_message(f"  Could not read final Zarr store: {e}", log_file)
+
+        log_message(f"\nOutputs:", log_file)
+        log_message(f"  Zarr: {zarr_summary_path}", log_file)
         if make_plots:
-            log_message(f"  Plots: {step2_plots_dir}",log_file)
+            log_message(f"  Plots: {step2_plots_dir}", log_file)
         if _owns_log:
-            log_message(f"  Log: {log_path}",log_file)
-        log_message(f"\nRun completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",log_file)
+            log_message(f"  Log: {log_path}", log_file)
+        log_message(
+            f"\nRun completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            log_file
+        )
 
     finally:
         if _owns_log and log_file is not None:
             log_file.close()
+            log_file = None
+            if is_s3_path(output_dir):
+                upload_log_to_s3(log_path, output_dir, fire_name)
+            
 
     if _owns_log:
         print(f"\n{'=' * 70}")
-        print(f"Log file saved: {log_path}")
+        print(f"Log saved: {log_path}")
         print(f"{'=' * 70}")
 
 
@@ -2541,164 +2663,40 @@ if __name__ == "__main__":
         description="Standardize and grid VIIRS swath data into a Zarr datacube."
     )
 
-    # ===================================================================
-    # REQUIRED ARGUMENTS
-    # ===================================================================
+    # Required
+    parser.add_argument("--fire_name", type=str, required=True)
+    parser.add_argument("--start",     type=str, required=True)
+    parser.add_argument("--end",       type=str, required=True)
+    parser.add_argument("--bbox",      type=str, required=True,
+                        help="'[xmin, ymin, xmax, ymax]'")
+    parser.add_argument("--n_timesteps", type=int, default=-1)
 
-    parser.add_argument(
-        "--fire_name",
-        type=str,
-        required=True,
-        help="Name of the fire/region (used for output directory naming). E.g. 'Stanford_Flaring'"
-    )
-    parser.add_argument(
-        "--start",
-        type=str,
-        required=True,
-        help="Start date for data query in YYYY-MM-DD format. E.g. '2026-05-10'"
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        required=True,
-        help="End date for data query in YYYY-MM-DD format. E.g. '2026-08-30'"
-    )
-    parser.add_argument(
-        "--bbox",
-        type=str,
-        required=True,
-        help="Bounding box as '[xmin, ymin, xmax, ymax]'. E.g. --bbox '[-112.25, 32.25, -111.25, 33.25]'"
-    )
-    parser.add_argument(
-        "--n_timesteps",
-        type=int,
-        default=-1,
-        help="Number of timesteps to process. Use -1 (default) to process all."
-    )
-
-    # ===================================================================
-    # OPTIONAL ARGUMENTS
-    # ===================================================================
-
-    parser.add_argument(
-        "--grid_region",
-        type=str,
-        default='conus',
-        help="Reference grid region. Options: 'conus', 'global', 'custom'. Default: 'conus'."
-    )
-    parser.add_argument(
-        "--grid_resolution",
-        type=int,
-        default=375,
-        help="Reference grid cell size in meters. Default: 375."
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=False,
-        help="If set, reprocess and overwrite existing output files."
-    )
-    parser.add_argument(
-        "--make_plots",
-        action="store_true",
-        default=False,
-        help="If set, generate and save gridded swath plots."
-    )
-    parser.add_argument(
-        "--copy_to_s3",
-        action="store_true",
-        default=False,
-        help="If set, copy outputs to S3 after processing."
-    )
-    parser.add_argument(
-        "--s3_prefix",
-        type=str,
-        default=None,
-        help="S3 destination prefix. Required if --copy_to_s3 is set. E.g. 's3://my-bucket/outputs/'"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default='VIIRS-cubed-outputs',
-        help="Local base directory for all outputs. Defaults to 'VIIRS-cubed-outputs'."
-    )
-    parser.add_argument(
-        "--remove_local",
-        action="store_true",
-        default=False,
-        help="If set, remove local output files after a successful S3 upload. Requires --copy_to_s3."
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=50,
-        help="Number of swaths to accumulate before flushing to the local Zarr store. Default: 50."
-    )
-    parser.add_argument(
-        "--grid_pad",
-        type=int,
-        default=10,
-        help="Extra grid cells of padding around the bounding box. Default: 10."
-    )
-    parser.add_argument(
-        "--remove_bowtie",
-        action="store_true",
-        default=False,
-        help="If set, remove bowtie-affected pixels before aggregation."
-    )
-    parser.add_argument(
-        "--deduplicate_scans",
-        action="store_true",
-        default=False,
-        help="If set, deduplicate overlapping scan lines before aggregation."
-    )
-    parser.add_argument(
-        "--add_persistence",
-        action="store_true",
-        default=False,
-        help="If set, compute fire persistence metrics after gridding and write them to the Zarr store."
-    )
-    parser.add_argument(
-        "--persistence_fire_mask_col",
-        type=str,
-        default=None,
-        help="Fire mask column to use for persistence. If not set, runs both 'fire_mask_max' and 'fire_mask_area_weighted_majority'."
-    )
-    parser.add_argument(
-        "--persistence_suffix",
-        type=str,
-        default=None,
-        help="Suffix for persistence output variables. Required when --persistence_fire_mask_col is set."
-    )
-    parser.add_argument(
-        "--persistence_start_threshold",
-        type=int,
-        default=6,
-        help="Fire mask threshold for ignition detection. Default: 6."
-    )
-    parser.add_argument(
-        "--persistence_end_threshold",
-        type=int,
-        default=6,
-        help="Fire mask threshold for sustained detection. Default: 6."
-    )
+    # Optional
+    parser.add_argument("--grid_region",     type=str, default='conus')
+    parser.add_argument("--grid_resolution", type=int, default=375)
+    parser.add_argument("--overwrite",       action="store_true", default=False)
+    parser.add_argument("--make_plots",      action="store_true", default=False)
+    parser.add_argument("--output_dir",      type=str,
+                        default='VIIRS-cubed-outputs',
+                        help=("Local path or S3 URI (s3://bucket/prefix/). "
+                              "When S3, Step 1 files are read from S3 and the "
+                              "Zarr store is buffered locally then copied to S3."))
+    parser.add_argument("--batch_size",       type=int,  default=50)
+    parser.add_argument("--grid_pad",         type=int,  default=10)
+    parser.add_argument("--remove_bowtie",    action="store_true", default=False)
+    parser.add_argument("--deduplicate_scans",action="store_true", default=False)
+    parser.add_argument("--add_persistence",  action="store_true", default=False)
+    parser.add_argument("--persistence_fire_mask_col", type=str, default=None)
+    parser.add_argument("--persistence_suffix",        type=str, default=None)
+    parser.add_argument("--persistence_start_threshold", type=int, default=6)
+    parser.add_argument("--persistence_end_threshold",   type=int, default=6)
 
     args = parser.parse_args()
 
-    # ===================================================================
-    # VALIDATE ARGUMENT COMBINATIONS
-    # ===================================================================
-
-    if args.copy_to_s3 and args.s3_prefix is None:
-        parser.error("--s3_prefix is required when --copy_to_s3 is set.")
-    if args.remove_local and not args.copy_to_s3:
-        parser.error("--remove_local requires --copy_to_s3.")
     if args.persistence_fire_mask_col is not None and args.persistence_suffix is None:
-        parser.error("--persistence_suffix is required when --persistence_fire_mask_col is set.")
-
-    # ===================================================================
-    # CALL standardize_swaths
-    # ===================================================================
+        parser.error(
+            "--persistence_suffix is required when --persistence_fire_mask_col is set."
+        )
 
     bbox = ast.literal_eval(args.bbox)
 
@@ -2712,10 +2710,7 @@ if __name__ == "__main__":
         grid_resolution=args.grid_resolution,
         overwrite=args.overwrite,
         make_plots=args.make_plots,
-        copy_to_s3=args.copy_to_s3,
-        s3_prefix=args.s3_prefix,
         output_dir=args.output_dir,
-        remove_local=args.remove_local,
         batch_size=args.batch_size,
         grid_pad=args.grid_pad,
         remove_bowtie=args.remove_bowtie,
@@ -2731,20 +2726,16 @@ if __name__ == "__main__":
     # USAGE EXAMPLE
     # ===================================================================
     #
+    # Local output:
     # python standardizations.py \
     #     --fire_name 'Dragon_Bravo_TEST' \
-    #     --start '2025-07-01' \
-    #     --end '2025-07-10' \
+    #     --start '2025-07-01' --end '2025-07-10' \
     #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
-    #     --n_timesteps -1 \
-    #     --grid_region 'conus' \
-    #     --grid_resolution 375 \
-    #     --batch_size 50 \
-    #     --grid_pad 10 \
-    #     --copy_to_s3 \
-    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
-    #     --output_dir 'VIIRS-cubed-outputs' \
-    #     --overwrite \
-    #     --add_persistence \
-    #     --persistence_start_threshold 6 \
-    #     --persistence_end_threshold 6
+    #     --output_dir 'VIIRS-cubed-outputs'
+    #
+    # S3 output:
+    # python standardizations.py \
+    #     --fire_name 'Dragon_Bravo_TEST' \
+    #     --start '2025-07-01' --end '2025-07-10' \
+    #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
+    #     --output_dir 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/'

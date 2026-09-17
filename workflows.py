@@ -1,12 +1,10 @@
 import ast
 import datetime as dt
 import os
-import shutil
-import subprocess
 
 from swath_preprocessing import process_swaths
 from standardizations import standardize_swaths
-from utils import log_message, _append_line_to_s3_log
+from utils import log_message, upload_log_to_s3, is_s3_path
 
 
 def process_single_fire(
@@ -17,7 +15,7 @@ def process_single_fire(
     bbox,
     n_timesteps=-1,
 
-    # --- Step 1 parameters (process_swaths) ---
+    # --- Step 1 parameters ---
     pix_lut_path=None,
     sensors=['SNPP', 'NOAA20', 'NOAA21'],
     make_plots=False,
@@ -25,7 +23,7 @@ def process_single_fire(
     overwrite=False,
     run_spatial_test=True,
 
-    # --- Step 2 parameters (standardize_swaths) ---
+    # --- Step 2 parameters ---
     grid_region='conus',
     grid_resolution=375,
     batch_size=50,
@@ -34,26 +32,27 @@ def process_single_fire(
     deduplicate_scans=False,
 
     # --- Shared output/infra parameters ---
-    copy_to_s3=False,
-    s3_prefix=None,
     output_dir='VIIRS-cubed-outputs',
-    cleanup_local=False,
 
-    # --- Persistence parameters (compute_fire_persistence_baseline via standardize_swaths) ---
+    # --- Persistence parameters ---
     add_persistence=False,
-    persistence_fire_mask_col=None,
+    persistence_threshold_col=None,
     persistence_suffix=None,
-    persistence_start_threshold=6,
-    persistence_end_threshold=6,
+    persistence_start_threshold=0,
+    persistence_end_threshold=0,
+    area_fraction_col='candidate_area_fraction',
+    area_fraction_threshold=0.5,
 
     # --- Workflow-level logging ---
     save_workflow_log=True,
 ):
-    '''Preprocess and standardize VIIRS swath data for a single fire/region.
+    '''
+    Preprocess and standardize VIIRS swath data for a single fire/region.
 
     Runs Step 1 (swath preprocessing) followed by Step 2 (gridding into a
-    Zarr datacube). Optionally computes fire persistence metrics at the end
-    of Step 2 before any S3 upload or local removal.
+    Zarr datacube). Outputs are written to output_dir, which may be a local
+    path or an S3 URI (s3://bucket/prefix/). Both steps route transparently
+    based on the output_dir prefix.
 
     Parameters
     ----------
@@ -80,7 +79,7 @@ def process_single_fire(
     run_spatial_test : bool, optional
         Run spatial alignment test in Step 1. Default: True.
     grid_region : str, optional
-        Reference grid region: 'conus', 'global', or 'custom'. Default: 'conus'.
+        Reference grid region. Default: 'conus'.
     grid_resolution : int, optional
         Reference grid cell size in meters. Default: 375.
     batch_size : int, optional
@@ -91,62 +90,66 @@ def process_single_fire(
         Remove bowtie-affected pixels before aggregation. Default: False.
     deduplicate_scans : bool, optional
         Deduplicate overlapping scan lines. Default: False.
-    copy_to_s3 : bool, optional
-        Upload outputs to S3 after processing. Default: False.
-    s3_prefix : str or None, optional
-        S3 destination prefix. Required when copy_to_s3=True.
     output_dir : str, optional
-        Local base output directory. Default: 'VIIRS-cubed-outputs'.
-    cleanup_local : bool, optional
-        Delete local output directory after both steps complete and all logs
-        are uploaded to S3. Requires copy_to_s3=True. Unlike the step-level
-        remove_local, this runs once at the end and deletes files from 
-        both preprocessing and standardization steps. Default: False.
+        Base output directory. Accepts a local path or an S3 URI
+        (s3://bucket/prefix/). Default: 'VIIRS-cubed-outputs'.
     add_persistence : bool, optional
         Compute fire persistence metrics after gridding. Default: False.
-    persistence_fire_mask_col : str or None, optional
-        Fire mask column for persistence. If None (default), runs both
-        'fire_mask_max' (suffix 'max') and 'fire_mask_area_weighted_majority'
-        (suffix 'aw').
+    persistence_threshold_col : str or None, optional
+        Column for persistence classifications. If None, runs both
+        'candidate_confidence_max' and 'candidate_confidence_area_weighted_majority'.
     persistence_suffix : str or None, optional
-        Output variable suffix. Required when persistence_fire_mask_col is set.
+        Output variable suffix. Required when persistence_threshold_col is set.
     persistence_start_threshold : int, optional
-        Fire mask value threshold for ignition detection. Default: 6.
+        Fire mask value threshold for ignition detection. Default: 0.
     persistence_end_threshold : int, optional
-        Fire mask value threshold for sustained detection. Default: 6.
+        Fire mask value threshold for sustained detection. Default: 0.
+    area_fraction_col : str, optional
+        Variable in all_data giving the fraction of contributing pixel area
+        occupied by candidates at each (time, y, x). Default
+        'candidate_area_fraction'.
+    area_fraction_threshold : float, optional
+        Minimum area fraction required for a timestep to count as a
+        detection. Default 0.5 (candidates must cover >= 50% of the cell's
+        contributing area).
     save_workflow_log : bool, optional
-        If True, a single log file spanning both steps is written to
-        ``{output_dir}/{fire_name}_Gridded_VIIRS/Logs/`` alongside the
-        per-step logs. Filename: ``{fire_name}_workflow_log_{timestamp}.txt``.
+        Write a single log spanning both steps to the fire's Logs/ directory.
         Default: True.
     '''
-    if copy_to_s3 and s3_prefix is None:
-        raise ValueError("s3_prefix is required when copy_to_s3=True")
-    if cleanup_local and not copy_to_s3:
-        raise ValueError("cleanup_local=True requires copy_to_s3=True")
-    if persistence_fire_mask_col is not None and persistence_suffix is None:
-        raise ValueError("persistence_suffix is required when persistence_fire_mask_col is set")
 
-    # Open workflow-level log if requested
+    if persistence_threshold_col is not None and persistence_suffix is None:
+        raise ValueError(
+            "persistence_suffix is required when persistence_threshold_col is set"
+        )
+
+    # ===================================================================
+    # WORKFLOW LOG SETUP
+    # ===================================================================
+
     wf_log = None
+    workflow_log_path = None
+
     if save_workflow_log:
         logs_dir = os.path.join(
-            os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS", "Logs"
+            os.path.abspath('.'), f"{fire_name}_Gridded_VIIRS", "Logs"
         )
         os.makedirs(logs_dir, exist_ok=True)
-        run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_timestamp     = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         workflow_log_path = os.path.join(
             logs_dir, f"{fire_name}_workflow_log_{run_timestamp}.txt"
         )
         wf_log = open(workflow_log_path, 'a')
-        log_message("=" * 70, wf_log, include_timestamp=False)
-        log_message("VIIRS WORKFLOW LOG", wf_log, include_timestamp=False)
-        log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    wf_log, include_timestamp=False)
-        log_message("=" * 70, wf_log, include_timestamp=False)
-        log_message(f"Fire name: {fire_name}", wf_log)
+        log_message("=" * 70,                   wf_log, include_timestamp=False)
+        log_message("VIIRS WORKFLOW LOG",        wf_log, include_timestamp=False)
+        log_message(
+            f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            wf_log, include_timestamp=False
+        )
+        log_message("=" * 70,                   wf_log, include_timestamp=False)
+        log_message(f"Fire name:  {fire_name}",  wf_log)
         log_message(f"Date range: {start} to {end}", wf_log)
-        log_message(f"BBOX: {bbox}", wf_log)
+        log_message(f"BBOX:       {bbox}",       wf_log)
+        log_message(f"Output dir: {output_dir}", wf_log)
         log_message("", wf_log, include_timestamp=False)
 
     try:
@@ -172,15 +175,12 @@ def process_single_fire(
             save_data=save_data,
             overwrite=overwrite,
             run_spatial_test=run_spatial_test,
-            copy_to_s3=copy_to_s3,
-            s3_prefix=s3_prefix,
             output_dir=output_dir,
-            remove_local=False,
             log_file=wf_log,
         )
 
         # ===================================================================
-        # STEP 2: STANDARDIZATION (+ optional persistence)
+        # STEP 2: STANDARDIZATION
         # ===================================================================
 
         if wf_log:
@@ -200,56 +200,32 @@ def process_single_fire(
             grid_resolution=grid_resolution,
             overwrite=overwrite,
             make_plots=make_plots,
-            copy_to_s3=copy_to_s3,
-            s3_prefix=s3_prefix,
             batch_size=batch_size,
             grid_pad=grid_pad,
             remove_bowtie=remove_bowtie,
             deduplicate_scans=deduplicate_scans,
             output_dir=output_dir,
-            remove_local=False,
             add_persistence=add_persistence,
-            persistence_fire_mask_col=persistence_fire_mask_col,
+            persistence_threshold_col=persistence_threshold_col,
             persistence_suffix=persistence_suffix,
             persistence_start_threshold=persistence_start_threshold,
             persistence_end_threshold=persistence_end_threshold,
+            area_fraction_col=area_fraction_col,
+            area_fraction_threshold=area_fraction_threshold,
             log_file=wf_log,
         )
 
     finally:
-        base_output_dir = os.path.join(
-            os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS"
-        )
-
         if wf_log is not None:
             log_message("", wf_log, include_timestamp=False)
-            log_message(f"Workflow completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                        wf_log, include_timestamp=False)
-
-        if cleanup_local and copy_to_s3:
-            s3_dest = f"{s3_prefix.rstrip('/')}/{fire_name}_Gridded_VIIRS"
-            if wf_log is not None:
-                log_message(f"Attempting to remove: {base_output_dir}", wf_log,
-                            include_timestamp=False)
-                wf_log.close()
-                wf_log = None
-                subprocess.run( # upload file before removal
-                    ["aws", "s3", "cp", workflow_log_path,
-                     f"{s3_dest}/Logs/{os.path.basename(workflow_log_path)}"],
-                    capture_output=True, text=True
-                )
-            shutil.rmtree(base_output_dir)
-            if save_workflow_log:
-                _append_line_to_s3_log(
-                    f"{s3_dest}/Logs/{os.path.basename(workflow_log_path)}",
-                    f"Local directory removed successfully: {base_output_dir}"
-                )
-            print(f"\n{'='*60}")
-            print(f"Local files removed: {base_output_dir}")
-            print(f"{'='*60}")
-
-        if wf_log is not None:
+            log_message(
+                f"Workflow completed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                wf_log, include_timestamp=False
+            )
             wf_log.close()
+            wf_log = None
+            if is_s3_path(output_dir):
+                upload_log_to_s3(workflow_log_path, output_dir, fire_name)
             print(f"\n{'='*60}")
             print(f"Workflow log saved: {workflow_log_path}")
             print(f"{'='*60}")
@@ -259,199 +235,54 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Full VIIRS pipeline: preprocess swaths and standardize onto a reference grid."
+        description="Full VIIRS pipeline: preprocess swaths and grid into a Zarr datacube."
     )
 
-    # ===================================================================
-    # REQUIRED ARGUMENTS
-    # ===================================================================
+    # Required
+    parser.add_argument("--fire_name", type=str, required=True)
+    parser.add_argument("--start",     type=str, required=True)
+    parser.add_argument("--end",       type=str, required=True)
+    parser.add_argument("--bbox",      type=str, required=True,
+                        help="'[xmin, ymin, xmax, ymax]'")
 
-    parser.add_argument(
-        "--fire_name",
-        type=str,
-        required=True,
-        help="Name of the fire/region (used for output directory naming). E.g. 'Stanford_Flaring'"
-    )
-    parser.add_argument(
-        "--start",
-        type=str,
-        required=True,
-        help="Start date in YYYY-MM-DD format. E.g. '2026-05-10'"
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        required=True,
-        help="End date in YYYY-MM-DD format. E.g. '2026-08-30'"
-    )
-    parser.add_argument(
-        "--bbox",
-        type=str,
-        required=True,
-        help="Bounding box as '[xmin, ymin, xmax, ymax]'. E.g. --bbox '[-112.25, 32.25, -111.25, 33.25]'"
-    )
-
-    # ===================================================================
-    # OPTIONAL ARGUMENTS
-    # ===================================================================
-
-    parser.add_argument(
-        "--n_timesteps",
-        type=int,
-        default=-1,
-        help="Number of overpasses to process. Use -1 (default) to process all."
-    )
-    parser.add_argument(
-        "--pix_lut_path",
-        type=str,
-        default=None,
-        help="Local path to VIIRS pixel-size lookup table CSV."
-    )
-    parser.add_argument(
-        "--sensors",
-        type=str,
-        default='["SNPP", "NOAA20", "NOAA21"]',
-        help="JSON list of satellites to include. Default: '[\"SNPP\", \"NOAA20\", \"NOAA21\"]'."
-    )
-    parser.add_argument(
-        "--make_plots",
-        action="store_true",
-        default=False,
-        help="If set, generate diagnostic plots at both pipeline steps."
-    )
-    parser.add_argument(
-        "--no_save_data",
-        action="store_true",
-        default=False,
-        help="If set, skip saving Step 1 NetCDF output files."
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=False,
-        help="If set, reprocess and overwrite existing output files."
-    )
-    parser.add_argument(
-        "--no_spatial_test",
-        action="store_true",
-        default=False,
-        help="If set, skip the Step 1 spatial alignment test."
-    )
-    parser.add_argument(
-        "--grid_region",
-        type=str,
-        default='conus',
-        help="Reference grid region: 'conus', 'global', or 'custom'. Default: 'conus'."
-    )
-    parser.add_argument(
-        "--grid_resolution",
-        type=int,
-        default=375,
-        help="Reference grid cell size in meters. Default: 375."
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=50,
-        help="Swaths to accumulate before flushing to the Zarr store. Default: 50."
-    )
-    parser.add_argument(
-        "--grid_pad",
-        type=int,
-        default=10,
-        help="Extra grid cells of padding around the bounding box. Default: 10."
-    )
-    parser.add_argument(
-        "--remove_bowtie",
-        action="store_true",
-        default=False,
-        help="If set, remove bowtie-affected pixels before aggregation."
-    )
-    parser.add_argument(
-        "--deduplicate_scans",
-        action="store_true",
-        default=False,
-        help="If set, deduplicate overlapping scan lines before aggregation."
-    )
-    parser.add_argument(
-        "--copy_to_s3",
-        action="store_true",
-        default=False,
-        help="If set, copy outputs to S3 after processing."
-    )
-    parser.add_argument(
-        "--s3_prefix",
-        type=str,
-        default=None,
-        help="S3 destination prefix. Required if --copy_to_s3 is set. E.g. 's3://my-bucket/outputs/'"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default='VIIRS-cubed-outputs',
-        help="Local base directory for all outputs. Default: 'VIIRS-cubed-outputs'."
-    )
-    parser.add_argument(
-        "--cleanup_local",
-        action="store_true",
-        default=False,
-        help="If set, delete the local output directory after both steps complete and logs are uploaded to S3. Requires --copy_to_s3."
-    )
-    parser.add_argument(
-        "--add_persistence",
-        action="store_true",
-        default=False,
-        help="If set, compute fire persistence metrics after gridding and write them to the Zarr store."
-    )
-    parser.add_argument(
-        "--persistence_fire_mask_col",
-        type=str,
-        default=None,
-        help="Fire mask column for persistence. If not set, runs both 'fire_mask_max' and 'fire_mask_area_weighted_majority'."
-    )
-    parser.add_argument(
-        "--persistence_suffix",
-        type=str,
-        default=None,
-        help="Suffix for persistence output variables. Required when --persistence_fire_mask_col is set."
-    )
-    parser.add_argument(
-        "--persistence_start_threshold",
-        type=int,
-        default=6,
-        help="Fire mask threshold for ignition detection. Default: 6."
-    )
-    parser.add_argument(
-        "--persistence_end_threshold",
-        type=int,
-        default=6,
-        help="Fire mask threshold for sustained detection. Default: 6."
-    )
-    parser.add_argument(
-        "--save_workflow_log",
-        action="store_true",
-        default=True,
-        help="If set, write a single log spanning both pipeline steps to the fire's Logs/ directory."
-    )
+    # Optional
+    parser.add_argument("--n_timesteps",      type=int,  default=-1)
+    parser.add_argument("--pix_lut_path",     type=str,  default=None)
+    parser.add_argument("--sensors",          type=str,
+                        default='["SNPP", "NOAA20", "NOAA21"]')
+    parser.add_argument("--make_plots",       action="store_true", default=False)
+    parser.add_argument("--no_save_data",     action="store_true", default=False)
+    parser.add_argument("--overwrite",        action="store_true", default=False)
+    parser.add_argument("--no_spatial_test",  action="store_true", default=False)
+    parser.add_argument("--grid_region",      type=str, default='conus')
+    parser.add_argument("--grid_resolution",  type=int, default=375)
+    parser.add_argument("--batch_size",       type=int, default=50)
+    parser.add_argument("--grid_pad",         type=int, default=10)
+    parser.add_argument("--remove_bowtie",    action="store_true", default=False)
+    parser.add_argument("--deduplicate_scans",action="store_true", default=False)
+    parser.add_argument("--output_dir",       type=str,
+                        default='VIIRS-cubed-outputs',
+                        help=("Local path or S3 URI (s3://bucket/prefix/). "
+                              "Both steps route transparently based on prefix."))
+    parser.add_argument("--add_persistence",  action="store_true", default=False)
+    parser.add_argument("--persistence_threshold_col", type=str, default=None)
+    parser.add_argument("--persistence_suffix",        type=str, default=None)
+    parser.add_argument("--persistence_start_threshold", type=int, default=0)
+    parser.add_argument("--persistence_end_threshold",   type=int, default=0)
+    parser.add_argument("--area_fraction_col",            type=str,   default='candidate_area_fraction',
+                        help="Zarr variable used as the area gate for persistence detection.")
+    parser.add_argument("--area_fraction_threshold",      type=float, default=0.5,
+                        help="Minimum area fraction for a timestep to count as a detection (default: 0.5).")
+    parser.add_argument("--no_save_workflow_log", action="store_true", default=False)
 
     args = parser.parse_args()
 
-    # ===================================================================
-    # VALIDATE ARGUMENT COMBINATIONS
-    # ===================================================================
+    if args.persistence_threshold_col is not None and args.persistence_suffix is None:
+        parser.error(
+            "--persistence_suffix is required when --persistence_threshold_col is set."
+        )
 
-    if args.copy_to_s3 and args.s3_prefix is None:
-        parser.error("--s3_prefix is required when --copy_to_s3 is set.")
-    if args.cleanup_local and not args.copy_to_s3:
-        parser.error("--cleanup_local requires --copy_to_s3.")
-    if args.persistence_fire_mask_col is not None and args.persistence_suffix is None:
-        parser.error("--persistence_suffix is required when --persistence_fire_mask_col is set.")
-
-    # ===================================================================
-    # CALL process_single_fire
-    # ===================================================================
-
-    bbox = ast.literal_eval(args.bbox)
+    bbox    = ast.literal_eval(args.bbox)
     sensors = ast.literal_eval(args.sensors)
 
     process_single_fire(
@@ -472,37 +303,36 @@ if __name__ == '__main__':
         grid_pad=args.grid_pad,
         remove_bowtie=args.remove_bowtie,
         deduplicate_scans=args.deduplicate_scans,
-        copy_to_s3=args.copy_to_s3,
-        s3_prefix=args.s3_prefix,
         output_dir=args.output_dir,
-        cleanup_local=args.cleanup_local,
         add_persistence=args.add_persistence,
-        persistence_fire_mask_col=args.persistence_fire_mask_col,
+        persistence_threshold_col=args.persistence_threshold_col,
         persistence_suffix=args.persistence_suffix,
         persistence_start_threshold=args.persistence_start_threshold,
         persistence_end_threshold=args.persistence_end_threshold,
-        save_workflow_log=args.save_workflow_log,
+        area_fraction_col=args.area_fraction_col,
+        area_fraction_threshold=args.area_fraction_threshold,
+        save_workflow_log=not args.no_save_workflow_log,
     )
 
     # ===================================================================
     # USAGE EXAMPLE
     # ===================================================================
     #
+    # Local output:
     # python workflows.py \
     #     --fire_name 'Dragon_Bravo_TEST' \
-    #     --start '2025-07-01' \
-    #     --end '2025-07-10' \
+    #     --start '2025-07-01' --end '2025-07-10' \
     #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
-    #     --n_timesteps -1 \
-    #     --sensors '["SNPP", "NOAA20", "NOAA21"]' \
-    #     --grid_region 'conus' \
-    #     --grid_resolution 375 \
-    #     --batch_size 50 \
-    #     --grid_pad 10 \
-    #     --add_persistence \
-    #     --copy_to_s3 \
-    #     --s3_prefix 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
-    #     --output_dir 'VIIRS-cubed-outputs' \
-    #     --overwrite \
-    #     --cleanup_local \
-    #     --save_workflow_log
+    #     --output_dir 'VIIRS-cubed-outputs' --overwrite
+    #
+    # S3 output with persistence:
+    # python workflows.py \
+    #     --fire_name 'Dragon_Bravo_TEST' \
+    #     --start '2025-07-01' --end '2025-07-10' \
+    #     --bbox '[-112.309113, 36.112467, -111.800995, 36.748712]' \
+    #     --output_dir 's3://maap-ops-workspace/shared/gsfc_landslides/FireSense/' \
+    #     --overwrite --add_persistence \
+    #     --area_fraction_col 'candidate_area_fraction' \
+    #     --area_fraction_threshold 0.5
+    # ===================================================================
+
