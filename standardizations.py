@@ -1206,7 +1206,7 @@ def aggregate_pixels_to_grid(mapping_df, swath_gdf, verbose=True):
     if verbose:
         print(f"  Computing area-weighted BT means and NaN fractions...")
     
-    for bt_var in bt_available: # loop through eact bt var again
+    for bt_var in bt_available: # loop through each bt var again
         
         valid = mapping_full[bt_var].notna() # mask any nans for that bt var (i4, i5, delta)
         
@@ -2686,16 +2686,16 @@ if __name__ == "__main__":
     parser.add_argument("--remove_bowtie",    action="store_true", default=False)
     parser.add_argument("--deduplicate_scans",action="store_true", default=False)
     parser.add_argument("--add_persistence",  action="store_true", default=False)
-    parser.add_argument("--persistence_fire_mask_col", type=str, default=None)
+    parser.add_argument("--persistence_threshold_col", type=str, default=None)
     parser.add_argument("--persistence_suffix",        type=str, default=None)
     parser.add_argument("--persistence_start_threshold", type=int, default=6)
     parser.add_argument("--persistence_end_threshold",   type=int, default=6)
 
     args = parser.parse_args()
 
-    if args.persistence_fire_mask_col is not None and args.persistence_suffix is None:
+    if args.persistence_threshold_col is not None and args.persistence_suffix is None:
         parser.error(
-            "--persistence_suffix is required when --persistence_fire_mask_col is set."
+            "--persistence_suffix is required when --persistence_threshold_col is set."
         )
 
     bbox = ast.literal_eval(args.bbox)
@@ -2716,7 +2716,7 @@ if __name__ == "__main__":
         remove_bowtie=args.remove_bowtie,
         deduplicate_scans=args.deduplicate_scans,
         add_persistence=args.add_persistence,
-        persistence_fire_mask_col=args.persistence_fire_mask_col,
+        persistence_threshold_col=args.persistence_threshold_col,
         persistence_suffix=args.persistence_suffix,
         persistence_start_threshold=args.persistence_start_threshold,
         persistence_end_threshold=args.persistence_end_threshold,
