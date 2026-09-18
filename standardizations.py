@@ -46,6 +46,7 @@ import cartopy.mpl.gridliner
 
 def query_available_swath_data(fire_name, output_dir='VIIRS-cubed-outputs'):
 
+    # determine output path based on whether s3 is included in the output path or not
     if is_s3_path(output_dir):
         data_dir = (
             f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
@@ -1944,9 +1945,9 @@ def _write_persistence_vars(ds_with_persistence, zarr_store, suffix_list):
     """Write only the persistence variables into zarr_store, in-place."""
     _var_templates = [
         'persistence_hours_baseline_{s}', 't_fire_start_{s}',
-        't_fire_end_baseline_{s}',        'n_day_detection_windows_{s}',
-        'n_night_detection_windows_{s}',     'n_total_detection_windows_{s}',
-        'dp_ratio_{s}',                   'n_cloud_detection_windows_{s}',
+        't_fire_end_baseline_{s}','n_day_detection_windows_{s}',
+        'n_night_detection_windows_{s}','n_total_detection_windows_{s}',
+        'dp_ratio_{s}', 'n_cloud_detection_windows_{s}',
     ]
     z = zarr.open(zarr_store, mode='r+')
     for suffix in suffix_list:
@@ -2060,9 +2061,9 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
     if _s3_output:
         # Step 1 data lives on S3
-        s3_base    = f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
+        s3_base = f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
         s3_zarr_path = f"{s3_base}/Data/{fire_name}_datacube.zarr"
-        fs         = s3fs.S3FileSystem()
+        fs = s3fs.S3FileSystem()
 
         # Local buffer for Zarr writes (fixed path, survives crashes)
         local_zarr_path = os.path.abspath(
@@ -2075,21 +2076,21 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
             os.path.join('zarr_buffer', f"{fire_name}_logs")
         )
         os.makedirs(local_logs_dir, exist_ok=True)
-        logs_dir     = local_logs_dir
-        step2_plots_dir   = os.path.join(local_logs_dir, "Step2_Gridded_Swaths")
+        logs_dir = local_logs_dir
+        step2_plots_dir = os.path.join(local_logs_dir, "Step2_Gridded_Swaths")
         mapping_output_dir = os.path.join(local_logs_dir, "mappings")
     else:
-        base_output_dir    = os.path.join(
+        base_output_dir = os.path.join(
             os.path.abspath(output_dir), f"{fire_name}_Gridded_VIIRS"
         )
-        step2_plots_dir    = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
-        logs_dir           = os.path.join(base_output_dir, "Logs")
+        step2_plots_dir = os.path.join(base_output_dir, "Plots", "Step2_Gridded_Swaths")
+        logs_dir = os.path.join(base_output_dir, "Logs")
         mapping_output_dir = os.path.join(base_output_dir, "Data", "mappings")
-        local_zarr_path    = os.path.join(
+        local_zarr_path = os.path.join(
             base_output_dir, "Data", f"{fire_name}_datacube.zarr"
         )
         s3_zarr_path = None
-        fs           = None
+        fs = None
 
     for directory in [step2_plots_dir, logs_dir, mapping_output_dir]:
         os.makedirs(directory, exist_ok=True)
@@ -2098,8 +2099,8 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     # QUERY STEP 1 FILES + BUILD GRID
     # ===================================================================
 
-    swath_df   = query_available_swath_data(fire_name, output_dir=output_dir)
-    grid_meta  = create_reference_grid(region=grid_region, resolution=grid_resolution)
+    swath_df = query_available_swath_data(fire_name, output_dir=output_dir)
+    grid_meta = create_reference_grid(region=grid_region, resolution=grid_resolution)
     fire_extent, grid_gdf = create_fire_grid_extent(bbox, grid_meta, pad=grid_pad)
 
     print(f"\nReference grid: EPSG:{grid_meta['crs_epsg']}, {grid_meta['resolution_m']}m")
@@ -2127,7 +2128,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
     if _s3_output and fs.exists(s3_zarr_path) and not overwrite:
         try:
-            store      = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+            store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
             existing_ds = xr.open_zarr(store)
             existing_times = set(pd.DatetimeIndex(existing_ds['time'].values))
             existing_ds.close()
@@ -2148,35 +2149,35 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
     # ===================================================================
 
     run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename  = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
-    log_path      = os.path.join(logs_dir, log_filename)
+    log_filename = f"{fire_name}_step2_gridding_log_{run_timestamp}.txt"
+    log_path = os.path.join(logs_dir, log_filename)
 
     _owns_log = log_file is None
     if _owns_log:
         log_file = open(log_path, 'w')
 
     try:
-        log_message("=" * 70,                             log_file, include_timestamp=False)
+        log_message("=" * 70, log_file, include_timestamp=False)
         log_message("STEP 2: SWATH-TO-GRID PROCESSING LOG", log_file, include_timestamp=False)
         log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     log_file, include_timestamp=False)
-        log_message("=" * 70,                             log_file, include_timestamp=False)
-        log_message(f"Fire name:      {fire_name}",       log_file)
-        log_message(f"BBOX:           {bbox}",            log_file)
-        log_message(f"Date range:     {start} to {end}",  log_file)
+        log_message("=" * 70, log_file, include_timestamp=False)
+        log_message(f"Fire name: {fire_name}", log_file)
+        log_message(f"BBOX: {bbox}", log_file)
+        log_message(f"Date range: {start} to {end}", log_file)
         log_message(f"Reference grid: EPSG:{grid_meta['crs_epsg']}, "
-                    f"{grid_meta['resolution_m']}m",      log_file)
-        log_message(f"Fire extent:    {fire_extent['n_rows']}×{fire_extent['n_cols']}",
+                    f"{grid_meta['resolution_m']}m", log_file)
+        log_message(f"Fire extent: {fire_extent['n_rows']}×{fire_extent['n_cols']}",
                     log_file)
-        log_message(f"Output dir:     {output_dir}",      log_file)
-        log_message(f"Local Zarr:     {local_zarr_path}", log_file)
+        log_message(f"Output dir: {output_dir}", log_file)
+        log_message(f"Local Zarr: {local_zarr_path}", log_file)
         if _s3_output:
-            log_message(f"S3 Zarr:    {s3_zarr_path}",   log_file)
-        log_message(f"Batch size:     {batch_size}",      log_file)
+            log_message(f"S3 Zarr: {s3_zarr_path}", log_file)
+        log_message(f"Batch size: {batch_size}", log_file)
         log_message(f"Total swath files: {len(swath_df)}", log_file)
-        log_message(f"Max to process: {n_timesteps}",     log_file)
-        log_message(f"Overwrite:      {overwrite}",       log_file)
-        log_message(f"Make plots:     {make_plots}",      log_file)
+        log_message(f"Max to process: {n_timesteps}", log_file)
+        log_message(f"Overwrite: {overwrite}", log_file)
+        log_message(f"Make plots: {make_plots}", log_file)
         log_message(f"Existing timesteps: {len(existing_times)}", log_file)
         log_message("", log_file)
 
@@ -2190,14 +2191,14 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         log_message(f"{'=' * 70}", log_file, include_timestamp=False)
         log_message("", log_file)
 
-        processed_count      = 0
-        skipped_count        = 0
+        processed_count = 0
+        skipped_count = 0
         already_exists_count = 0
-        error_count          = 0
+        error_count = 0
         all_cleaning_reports = []
-        pending_datasets     = []
-        pending_metadata     = []
-        timing_records       = []
+        pending_datasets = []
+        pending_metadata = []
+        timing_records = []
 
         swaths_to_process = swath_df if n_timesteps == -1 else swath_df.iloc[:n_timesteps]
         log_message(f"PROCESSING {len(swaths_to_process)} SWATHS",
@@ -2207,9 +2208,9 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
         for idx, swath_info in pbar:
 
-            sat            = swath_info['satellite']
-            timestamp      = swath_info['timestamp']
-            filepath       = swath_info['filepath']
+            sat = swath_info['satellite']
+            timestamp = swath_info['timestamp']
+            filepath = swath_info['filepath']
             file_timestamp = timestamp.strftime('%Y%m%d_%H%M')
 
             pbar.set_description(
@@ -2222,7 +2223,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                             log_file, print_to_console=False)
                 pbar.set_postfix({
                     'done': processed_count, 'exists': already_exists_count,
-                    'skip': skipped_count,   'err':    error_count,
+                    'skip': skipped_count, 'err': error_count,
                     'batch': len(pending_datasets),
                 })
                 continue
@@ -2236,7 +2237,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                 plot_exists = os.path.exists(plot_output_path) if make_plots else False
 
             t_total_start = time.time()
-            timing        = {'filename': f"{sat}_{file_timestamp}"}
+            timing = {'filename': f"{sat}_{file_timestamp}"}
 
             try:
                 # Load swath — xr.open_dataset works for both local and S3
@@ -2263,7 +2264,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     del mapping_df, swath_gdf
                     pbar.set_postfix({
                         'done': processed_count, 'exists': already_exists_count,
-                        'skip': skipped_count,   'err':    error_count,
+                        'skip': skipped_count, 'err': error_count,
                         'batch': len(pending_datasets),
                     })
                     continue
@@ -2278,7 +2279,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     )
                     timing['t_clean'] = time.time() - t0
                     report.update({
-                        'filename':  f"{sat}_{file_timestamp}",
+                        'filename': f"{sat}_{file_timestamp}",
                         'satellite': sat,
                         'timestamp': str(timestamp),
                     })
@@ -2293,7 +2294,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     swath_ds.close()
                     pbar.set_postfix({
                         'done': processed_count, 'exists': already_exists_count,
-                        'skip': skipped_count,   'err':    error_count,
+                        'skip': skipped_count, 'err': error_count,
                         'batch': len(pending_datasets),
                     })
                     continue
@@ -2372,7 +2373,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
 
                 # Flush batch to local Zarr if full
                 if len(pending_datasets) >= batch_size:
-                    t0       = time.time()
+                    t0 = time.time()
                     batch_ds = xr.concat(pending_datasets, dim='time')
                     t_concat = time.time() - t0
 
@@ -2403,10 +2404,10 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     gc.collect()
 
                 pbar.set_postfix({
-                    'done':  processed_count,
+                    'done': processed_count,
                     'exists': already_exists_count,
-                    'skip':  skipped_count,
-                    'err':   error_count,
+                    'skip': skipped_count,
+                    'err': error_count,
                     'batch': len(pending_datasets),
                 })
 
@@ -2420,10 +2421,10 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     log_file, print_to_console=True
                 )
                 pbar.set_postfix({
-                    'done':  processed_count,
+                    'done': processed_count,
                     'exists': already_exists_count,
-                    'skip':  skipped_count,
-                    'err':   error_count,
+                    'skip': skipped_count,
+                    'err': error_count,
                     'batch': len(pending_datasets),
                 })
                 continue
@@ -2471,7 +2472,7 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     # Full overwrite — remove existing S3 store first
                     fs.rm(s3_zarr_path, recursive=True)
                     local_ds = xr.open_zarr(local_zarr_path)
-                    store    = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                    store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                     encoding = get_zarr_encoding(local_ds, fire_extent)
                     local_ds.to_zarr(store, mode='w', encoding=encoding)
                     local_ds.close()
@@ -2485,13 +2486,13 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                     ]
                     if new_times:
                         new_ds = local_ds.sel(time=new_times)
-                        store  = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                        store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                         new_ds.to_zarr(store, mode='a', append_dim='time')
                     local_ds.close()
             else:
                 # No existing S3 store — full write
                 local_ds = xr.open_zarr(local_zarr_path)
-                store    = s3fs.S3Map(root=s3_zarr_path, s3=fs)
+                store = s3fs.S3Map(root=s3_zarr_path, s3=fs)
                 encoding = get_zarr_encoding(local_ds, fire_extent)
                 local_ds.to_zarr(store, mode='w', encoding=encoding)
                 local_ds.close()
@@ -2509,11 +2510,11 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         if add_persistence:
             if persistence_threshold_col is None:
                 _suffixes = ['max', 'aw']
-                _cols     = ['candidate_confidence_max',
-                             'candidate_confidence_area_weighted_majority']
+                _cols = ['candidate_confidence_max',
+                          'candidate_confidence_area_weighted_majority']
             else:
                 _suffixes = [persistence_suffix]
-                _cols     = [persistence_threshold_col]
+                _cols = [persistence_threshold_col]
 
             if not local_zarr_written:
                 log_message(
@@ -2554,13 +2555,13 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
         # SUMMARY
         # ===================================================================
 
-        log_message(f"\n{'=' * 70}",      log_file, include_timestamp=False)
+        log_message(f"\n{'=' * 70}", log_file, include_timestamp=False)
         log_message("PROCESSING COMPLETE", log_file)
-        log_message(f"{'=' * 70}",        log_file, include_timestamp=False)
-        log_message(f"  Successfully processed:    {processed_count}",       log_file)
-        log_message(f"  Already existed (skipped): {already_exists_count}",  log_file)
-        log_message(f"  Skipped (no data/empty):   {skipped_count}",         log_file)
-        log_message(f"  Errors:                    {error_count}",           log_file)
+        log_message(f"{'=' * 70}",log_file, include_timestamp=False)
+        log_message(f"  Successfully processed:{processed_count}", log_file)
+        log_message(f"  Already existed (skipped): {already_exists_count}", log_file)
+        log_message(f"  Skipped (no data/empty): {skipped_count}",         log_file)
+        log_message(f"  Errors: {error_count}", log_file)
         log_message(
             f"  Total: "
             f"{processed_count + already_exists_count + skipped_count + error_count}",
@@ -2588,8 +2589,8 @@ def standardize_swaths(fire_name, bbox, start, end, n_timesteps,
                         log_file)
 
         if timing_records:
-            timing_df  = pd.DataFrame(timing_records)
-            completed  = timing_df[timing_df.get('error', pd.Series([None] * len(timing_df))).isna()].copy()
+            timing_df = pd.DataFrame(timing_records)
+            completed = timing_df[timing_df.get('error', pd.Series([None] * len(timing_df))).isna()].copy()
             if len(completed) > 0:
                 step_cols = [
                     't_load', 't_map', 't_clean',
@@ -2665,31 +2666,31 @@ if __name__ == "__main__":
 
     # Required
     parser.add_argument("--fire_name", type=str, required=True)
-    parser.add_argument("--start",     type=str, required=True)
-    parser.add_argument("--end",       type=str, required=True)
-    parser.add_argument("--bbox",      type=str, required=True,
+    parser.add_argument("--start", type=str, required=True)
+    parser.add_argument("--end", type=str, required=True)
+    parser.add_argument("--bbox", type=str, required=True,
                         help="'[xmin, ymin, xmax, ymax]'")
     parser.add_argument("--n_timesteps", type=int, default=-1)
 
     # Optional
-    parser.add_argument("--grid_region",     type=str, default='conus')
+    parser.add_argument("--grid_region", type=str, default='conus')
     parser.add_argument("--grid_resolution", type=int, default=375)
-    parser.add_argument("--overwrite",       action="store_true", default=False)
-    parser.add_argument("--make_plots",      action="store_true", default=False)
-    parser.add_argument("--output_dir",      type=str,
+    parser.add_argument("--overwrite", action="store_true", default=False)
+    parser.add_argument("--make_plots", action="store_true", default=False)
+    parser.add_argument("--output_dir", type=str,
                         default='VIIRS-cubed-outputs',
                         help=("Local path or S3 URI (s3://bucket/prefix/). "
                               "When S3, Step 1 files are read from S3 and the "
                               "Zarr store is buffered locally then copied to S3."))
-    parser.add_argument("--batch_size",       type=int,  default=50)
-    parser.add_argument("--grid_pad",         type=int,  default=10)
-    parser.add_argument("--remove_bowtie",    action="store_true", default=False)
+    parser.add_argument("--batch_size", type=int, default=50)
+    parser.add_argument("--grid_pad", type=int,default=10)
+    parser.add_argument("--remove_bowtie", action="store_true", default=False)
     parser.add_argument("--deduplicate_scans",action="store_true", default=False)
-    parser.add_argument("--add_persistence",  action="store_true", default=False)
+    parser.add_argument("--add_persistence", action="store_true", default=False)
     parser.add_argument("--persistence_threshold_col", type=str, default=None)
-    parser.add_argument("--persistence_suffix",        type=str, default=None)
+    parser.add_argument("--persistence_suffix", type=str, default=None)
     parser.add_argument("--persistence_start_threshold", type=int, default=6)
-    parser.add_argument("--persistence_end_threshold",   type=int, default=6)
+    parser.add_argument("--persistence_end_threshold", type=int, default=6)
 
     args = parser.parse_args()
 

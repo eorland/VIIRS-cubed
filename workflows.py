@@ -79,7 +79,7 @@ def process_single_fire(
     run_spatial_test : bool, optional
         Run spatial alignment test in Step 1. Default: True.
     grid_region : str, optional
-        Reference grid region. Default: 'conus'.
+        Reference grid region: 'conus', 'global', or 'custom'. Default: 'conus'.
     grid_resolution : int, optional
         Reference grid cell size in meters. Default: 375.
     batch_size : int, optional
@@ -134,21 +134,21 @@ def process_single_fire(
             os.path.abspath('.'), f"{fire_name}_Gridded_VIIRS", "Logs"
         )
         os.makedirs(logs_dir, exist_ok=True)
-        run_timestamp     = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         workflow_log_path = os.path.join(
             logs_dir, f"{fire_name}_workflow_log_{run_timestamp}.txt"
         )
         wf_log = open(workflow_log_path, 'a')
-        log_message("=" * 70,                   wf_log, include_timestamp=False)
-        log_message("VIIRS WORKFLOW LOG",        wf_log, include_timestamp=False)
+        log_message("=" * 70, wf_log, include_timestamp=False)
+        log_message("VIIRS WORKFLOW LOG",wf_log, include_timestamp=False)
         log_message(
             f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             wf_log, include_timestamp=False
         )
-        log_message("=" * 70,                   wf_log, include_timestamp=False)
-        log_message(f"Fire name:  {fire_name}",  wf_log)
+        log_message("=" * 70, wf_log, include_timestamp=False)
+        log_message(f"Fire name: {fire_name}", wf_log)
         log_message(f"Date range: {start} to {end}", wf_log)
-        log_message(f"BBOX:       {bbox}",       wf_log)
+        log_message(f"BBOX: {bbox}", wf_log)
         log_message(f"Output dir: {output_dir}", wf_log)
         log_message("", wf_log, include_timestamp=False)
 
@@ -240,38 +240,38 @@ if __name__ == '__main__':
 
     # Required
     parser.add_argument("--fire_name", type=str, required=True)
-    parser.add_argument("--start",     type=str, required=True)
-    parser.add_argument("--end",       type=str, required=True)
-    parser.add_argument("--bbox",      type=str, required=True,
+    parser.add_argument("--start", type=str, required=True)
+    parser.add_argument("--end", type=str, required=True)
+    parser.add_argument("--bbox", type=str, required=True,
                         help="'[xmin, ymin, xmax, ymax]'")
 
     # Optional
-    parser.add_argument("--n_timesteps",      type=int,  default=-1)
-    parser.add_argument("--pix_lut_path",     type=str,  default=None)
-    parser.add_argument("--sensors",          type=str,
+    parser.add_argument("--n_timesteps", type=int,  default=-1)
+    parser.add_argument("--pix_lut_path", type=str,  default=None)
+    parser.add_argument("--sensors", type=str,
                         default='["SNPP", "NOAA20", "NOAA21"]')
-    parser.add_argument("--make_plots",       action="store_true", default=False)
-    parser.add_argument("--no_save_data",     action="store_true", default=False)
-    parser.add_argument("--overwrite",        action="store_true", default=False)
-    parser.add_argument("--no_spatial_test",  action="store_true", default=False)
-    parser.add_argument("--grid_region",      type=str, default='conus')
-    parser.add_argument("--grid_resolution",  type=int, default=375)
-    parser.add_argument("--batch_size",       type=int, default=50)
-    parser.add_argument("--grid_pad",         type=int, default=10)
-    parser.add_argument("--remove_bowtie",    action="store_true", default=False)
+    parser.add_argument("--make_plots", action="store_true", default=False)
+    parser.add_argument("--no_save_data", action="store_true", default=False)
+    parser.add_argument("--overwrite", action="store_true", default=False)
+    parser.add_argument("--no_spatial_test", action="store_true", default=False)
+    parser.add_argument("--grid_region", type=str, default='conus')
+    parser.add_argument("--grid_resolution", type=int, default=375)
+    parser.add_argument("--batch_size", type=int, default=50)
+    parser.add_argument("--grid_pad", type=int, default=10)
+    parser.add_argument("--remove_bowtie", action="store_true", default=False)
     parser.add_argument("--deduplicate_scans",action="store_true", default=False)
-    parser.add_argument("--output_dir",       type=str,
+    parser.add_argument("--output_dir", type=str,
                         default='VIIRS-cubed-outputs',
                         help=("Local path or S3 URI (s3://bucket/prefix/). "
                               "Both steps route transparently based on prefix."))
-    parser.add_argument("--add_persistence",  action="store_true", default=False)
+    parser.add_argument("--add_persistence", action="store_true", default=False)
     parser.add_argument("--persistence_threshold_col", type=str, default=None)
-    parser.add_argument("--persistence_suffix",        type=str, default=None)
+    parser.add_argument("--persistence_suffix", type=str, default=None)
     parser.add_argument("--persistence_start_threshold", type=int, default=0)
-    parser.add_argument("--persistence_end_threshold",   type=int, default=0)
-    parser.add_argument("--area_fraction_col",            type=str,   default='candidate_area_fraction',
+    parser.add_argument("--persistence_end_threshold", type=int, default=0)
+    parser.add_argument("--area_fraction_col", type=str, default='candidate_area_fraction',
                         help="Zarr variable used as the area gate for persistence detection.")
-    parser.add_argument("--area_fraction_threshold",      type=float, default=0.5,
+    parser.add_argument("--area_fraction_threshold", type=float, default=0.5,
                         help="Minimum area fraction for a timestep to count as a detection (default: 0.5).")
     parser.add_argument("--no_save_workflow_log", action="store_true", default=False)
 
@@ -282,7 +282,7 @@ if __name__ == '__main__':
             "--persistence_suffix is required when --persistence_threshold_col is set."
         )
 
-    bbox    = ast.literal_eval(args.bbox)
+    bbox = ast.literal_eval(args.bbox)
     sensors = ast.literal_eval(args.sensors)
 
     process_single_fire(

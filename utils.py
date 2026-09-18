@@ -375,8 +375,8 @@ def append_swath_metadata_row(row: dict, data_dir: str) -> None:
     data_dir : str
         Local path or S3 URI of the Step 1 data directory.
     """
-    path     = _swath_metadata_path(data_dir)
-    row_df   = pd.DataFrame([row])
+    path = _swath_metadata_path(data_dir)
+    row_df = pd.DataFrame([row])
 
     if is_s3_path(path):
         fs = s3fs.S3FileSystem()

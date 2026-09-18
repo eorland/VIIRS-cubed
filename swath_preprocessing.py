@@ -1160,21 +1160,21 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     if is_s3_path(output_dir):
         # Data and plots go to S3; derive prefix strings for logging only
         s3_base = f"{output_dir.rstrip('/')}/{fire_name}_Gridded_VIIRS"
-        data_dir   = f"{s3_base}/Data/Step1_Compiled_Swaths"
-        plots_dir  = f"{s3_base}/Plots/Step1_Compiled_Swaths"
+        data_dir = f"{s3_base}/Data/Step1_Compiled_Swaths"
+        plots_dir = f"{s3_base}/Plots/Step1_Compiled_Swaths"
         # Still need local dirs for logs and temp
         for d in [logs_dir, temp_dir_root]:
             os.makedirs(d, exist_ok=True)
         print(f"\nOutput structure:")
-        print(f"  Data:  {data_dir}")
+        print(f"  Data: {data_dir}")
         print(f"  Plots: {plots_dir}")
-        print(f"  Logs:  {logs_dir}  (local)")
+        print(f"  Logs: {logs_dir}  (local)")
     else:
         base_output_dir = os.path.join(os.path.abspath(output_dir),
                                        f"{fire_name}_Gridded_VIIRS")
-        plots_dir  = os.path.join(base_output_dir, "Plots", "Step1_Compiled_Swaths")
-        data_dir   = os.path.join(base_output_dir, "Data",  "Step1_Compiled_Swaths")
-        logs_dir   = os.path.join(base_output_dir, "Logs")
+        plots_dir = os.path.join(base_output_dir, "Plots", "Step1_Compiled_Swaths")
+        data_dir = os.path.join(base_output_dir, "Data",  "Step1_Compiled_Swaths")
+        logs_dir = os.path.join(base_output_dir, "Logs")
         temp_dir_root = os.path.join(base_output_dir, "_swath_temp")
         for d in [base_output_dir, plots_dir, data_dir, logs_dir]:
             os.makedirs(d, exist_ok=True)
@@ -1189,44 +1189,44 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     # ===================================================================
 
     run_timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename  = f"{fire_name}_processing_log_{run_timestamp}.txt"
-    log_path      = os.path.join(logs_dir, log_filename)
+    log_filename = f"{fire_name}_processing_log_{run_timestamp}.txt"
+    log_path = os.path.join(logs_dir, log_filename)
 
     _owns_log = log_file is None
     if _owns_log:
         log_file = open(log_path, 'w')
 
-    log_message("="*70,                                        log_file, include_timestamp=False)
-    log_message("VIIRS SWATH PROCESSING LOG",                  log_file, include_timestamp=False)
+    log_message("="*70, log_file, include_timestamp=False)
+    log_message("VIIRS SWATH PROCESSING LOG", log_file, include_timestamp=False)
     log_message(f"Run started: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 log_file, include_timestamp=False)
-    log_message("="*70,                                        log_file, include_timestamp=False)
-    log_message(f"Fire name:    {fire_name}",                  log_file)
-    log_message(f"Bounding box: {bbox}",                       log_file)
-    log_message(f"Date range:   {start} to {end}",             log_file)
-    log_message(f"Sensors:      {sensors}",                    log_file)
-    log_message(f"Max timesteps:{n_timesteps}",                log_file)
-    log_message(f"Overwrite:    {overwrite}",                  log_file)
-    log_message(f"Make plots:   {make_plots}",                 log_file)
-    log_message(f"Spatial test: {run_spatial_test}",           log_file)
-    log_message(f"Output dir:   {output_dir}",                 log_file)
-    log_message("",                                            log_file)
+    log_message("="*70, log_file, include_timestamp=False)
+    log_message(f"Fire name: {fire_name}", log_file)
+    log_message(f"Bounding box: {bbox}", log_file)
+    log_message(f"Date range:   {start} to {end}", log_file)
+    log_message(f"Sensors:      {sensors}", log_file)
+    log_message(f"Max timesteps:{n_timesteps}", log_file)
+    log_message(f"Overwrite:    {overwrite}", log_file)
+    log_message(f"Make plots:   {make_plots}", log_file)
+    log_message(f"Spatial test: {run_spatial_test}", log_file)
+    log_message(f"Output dir:   {output_dir}", log_file)
+    log_message("", log_file)
 
     # ===================================================================
     # GATHER FILEPATHS
     # ===================================================================
 
-    log_message(f"{'='*70}",          log_file, include_timestamp=False)
+    log_message(f"{'='*70}", log_file, include_timestamp=False)
     log_message(f"PROCESSING {n_timesteps} TIMESTEPS", log_file)
-    log_message(f"{'='*70}",          log_file, include_timestamp=False)
+    log_message(f"{'='*70}", log_file, include_timestamp=False)
     if not overwrite:
         log_message("OVERWRITE = False: Skipping existing files", log_file)
     log_message("", log_file)
 
-    processed_count      = 0
-    skipped_count        = 0
+    processed_count = 0
+    skipped_count = 0
     already_exists_count = 0
-    error_count          = 0
+    error_count = 0
     spatial_test_failures = []
 
     all_timesteps = gather_filepaths(bbox, start, end, sensors)
@@ -1250,15 +1250,15 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
     try:
         for timestep_info in pbar:
 
-            sat       = timestep_info['satellite']
+            sat = timestep_info['satellite']
             timestamp = timestep_info['timestamp']
             file_timestamp = timestamp.strftime('%Y%m%d_%H%M')
 
             pbar.set_description(f"Processing {sat} {timestamp.strftime('%Y-%m-%d %H:%M')}")
 
             # Output paths (local or S3)
-            data_filename   = f"{sat}_{file_timestamp}_swath.nc"
-            plot_filename   = f"{sat}_{file_timestamp}_swath.png"
+            data_filename = f"{sat}_{file_timestamp}_swath.nc"
+            plot_filename = f"{sat}_{file_timestamp}_swath.png"
 
             if is_s3_path(output_dir):
                 data_output_path = f"{data_dir}/{data_filename}"
@@ -1268,12 +1268,12 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                 plot_output_path = os.path.join(plots_dir, plot_filename)
 
             # Existence checks
-            data_exists = file_exists(data_output_path) if save_data   else False
-            plot_exists = file_exists(plot_output_path) if make_plots  else False
+            data_exists = file_exists(data_output_path) if save_data  else False
+            plot_exists = file_exists(plot_output_path) if make_plots else False
 
             if not overwrite:
-                skip_data = save_data   and data_exists
-                skip_plot = make_plots  and plot_exists
+                skip_data = save_data and data_exists
+                skip_plot = make_plots and plot_exists
 
                 if (not save_data or skip_data) and (not make_plots or skip_plot):
                     already_exists_count += 1
@@ -1281,9 +1281,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                                 log_file, print_to_console=False)
                     pbar.set_postfix({
                         'processed': processed_count,
-                        'exists':    already_exists_count,
-                        'skipped':   skipped_count,
-                        'errors':    error_count,
+                        'exists': already_exists_count,
+                        'skipped': skipped_count,
+                        'errors': error_count,
                     })
                     continue
 
@@ -1330,9 +1330,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                                 log_file, print_to_console=False)
                     pbar.set_postfix({
                         'processed': processed_count,
-                        'exists':    already_exists_count,
-                        'skipped':   skipped_count,
-                        'errors':    error_count,
+                        'exists': already_exists_count,
+                        'skipped': skipped_count,
+                        'errors': error_count,
                     })
                     continue
 
@@ -1353,14 +1353,14 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                             f"  I5 temp test:   {'PASSED' if spatial_results['i5_temp_test']['passed'] else 'FAILED'}",
                             log_file)
                         spatial_test_failures.append({
-                            'filename':  data_filename,
+                            'filename': data_filename,
                             'timestamp': str(timestamp),
-                            'results':   spatial_results,
+                            'results': spatial_results,
                         })
 
                 # Re-derive sat/timestamp from swath metadata
-                sat            = swath['satellite'].item()
-                timestamp      = pd.Timestamp(swath['timestamp_str'].item())
+                sat = swath['satellite'].item()
+                timestamp = pd.Timestamp(swath['timestamp_str'].item())
                 file_timestamp = timestamp.strftime('%Y%m%d_%H%M')
 
                 # Save data
@@ -1423,11 +1423,11 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                 processed_count += 1
                 pbar.set_postfix({
                     'processed': processed_count,
-                    'exists':    already_exists_count,
-                    'skipped':   skipped_count,
-                    'errors':    error_count,
-                    'dl':        f"{t_download:.0f}s",
-                    'proc':      f"{t_process:.0f}s",
+                    'exists': already_exists_count,
+                    'skipped': skipped_count,
+                    'errors': error_count,
+                    'dl': f"{t_download:.0f}s",
+                    'proc': f"{t_process:.0f}s",
                 })
 
             except Exception as e:
@@ -1436,9 +1436,9 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
                             log_file, print_to_console=True)
                 pbar.set_postfix({
                     'processed': processed_count,
-                    'exists':    already_exists_count,
-                    'skipped':   skipped_count,
-                    'errors':    error_count,
+                    'exists': already_exists_count,
+                    'skipped': skipped_count,
+                    'errors': error_count,
                 })
                 continue
 
@@ -1464,15 +1464,15 @@ def process_swaths(fire_name, start, end, bbox, n_timesteps, pix_lut_path=None,
             log_message(f"\n{'='*70}", log_file, include_timestamp=False)
             log_message("PROCESSING COMPLETE", log_file)
             log_message(f"{'='*70}", log_file, include_timestamp=False)
-            log_message(f"  Successfully processed:       {processed_count}", log_file)
-            log_message(f"  Already existed (skipped):    {already_exists_count}", log_file)
-            log_message(f"  Skipped (no bbox):            {skipped_count}", log_file)
-            log_message(f"  Errors:                       {error_count}", log_file)
+            log_message(f"  Successfully processed: {processed_count}", log_file)
+            log_message(f"  Already existed (skipped): {already_exists_count}", log_file)
+            log_message(f"  Skipped (no bbox): {skipped_count}", log_file)
+            log_message(f"  Errors: {error_count}", log_file)
             log_message(f"  Total: {processed_count + already_exists_count + skipped_count + error_count}",
                         log_file)
 
             if run_spatial_test:
-                log_message(f"\n  Spatial tests run:    {processed_count}", log_file)
+                log_message(f"\n  Spatial tests run: {processed_count}", log_file)
                 log_message(f"  Spatial test failures:{len(spatial_test_failures)}", log_file)
                 if spatial_test_failures:
                     log_message("  Files with issues:", log_file)
@@ -1565,7 +1565,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    bbox    = ast.literal_eval(args.bbox)
+    bbox = ast.literal_eval(args.bbox)
     sensors = ast.literal_eval(args.sensors)
 
     process_swaths(
