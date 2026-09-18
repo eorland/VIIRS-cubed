@@ -783,7 +783,7 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     t0 = time.time()
     # construct pixels
     swath_gdf = create_viirs_pixel_polygons(swath_ds, target_crs, verbose=verbose)
-    print(f"Polygon creation: {time.time()-t0:.1f}s, {len(swath_gdf)} pixels")
+    # print(f"Polygon creation: {time.time()-t0:.1f}s, {len(swath_gdf)} pixels")
     
     if len(swath_gdf) == 0:
         if verbose:
@@ -804,7 +804,7 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     # compute spatial join - each row represents a unique pixel ~ grid cell match
     # this is the foundation of our mapping df
     joined = gpd.sjoin(swath_gdf, grid_gdf, how='inner', predicate='intersects')
-    print(f"sjoin: {time.time()-t0:.1f}s, {len(joined)} pairs")
+    # print(f"sjoin: {time.time()-t0:.1f}s, {len(joined)} pairs")
     
     if len(joined) == 0:
         if verbose:
@@ -828,7 +828,7 @@ def map_swath_to_reference_grid(swath_ds, grid_gdf, verbose=True):
     t0 = time.time()
     # Vectorized intersection and area calculation
     intersections = shapely.intersection(pixel_geoms, grid_geoms)
-    print(f"intersection: {time.time()-t0:.1f}s")
+    # print(f"intersection: {time.time()-t0:.1f}s")
     pixel_overlap_areas_km2 = shapely.area(intersections) / 1e6 # convert to km2 from m
     pixel_areas_km2 = joined['pixel_area_km2_measured'].values # original pixel areas
     grid_cell_area_km2 = grid_gdf.loc[joined['index_right'], 'geometry'].area.values / 1e6 # compute native grid area
