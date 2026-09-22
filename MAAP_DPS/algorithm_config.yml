@@ -5,7 +5,7 @@ algorithm_description: >
   processes and compiles swaths into NetCDF files, and writes outputs
   directly to S3. State tracking is maintained in a parquet file.
 repository_url: https://github.com/eorland/VIIRS-cubed.git
-repo_branch: main
+code_version: main
 run_command: VIIRS-cubed/MAAP_DPS/run_viirs_batch.sh
 build_command: VIIRS-cubed/MAAP_DPS/build-env.sh
 disk_space: 32GB
