@@ -4,7 +4,7 @@ algorithm_description: >
   For each fire, queries and downloads VIIRS swath data from NASA Earthdata,
   processes and compiles swaths into NetCDF files, and writes outputs
   directly to S3. State tracking is maintained in a parquet file.
-repo_url: https://github.com/eorland/VIIRS-cubed.git
+repository_url: https://github.com/eorland/VIIRS-cubed.git
 repo_branch: main
 run_command: VIIRS-cubed/MAAP_DPS/run_viirs_batch.sh
 build_command: VIIRS-cubed/MAAP_DPS/build-env.sh
@@ -13,6 +13,8 @@ container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base
 queue: maap-dps-worker-32gb
 
 inputs:
+  file: []
+  config: []
   positional:
     - name: output_dir
       description: >
