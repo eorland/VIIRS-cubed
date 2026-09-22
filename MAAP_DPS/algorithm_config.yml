@@ -4,7 +4,7 @@ algorithm_description: >
   For each fire, queries and downloads VIIRS swath data from NASA Earthdata,
   processes and compiles swaths into NetCDF files, and writes outputs
   directly to S3. State tracking is maintained in a parquet file.
-repo_url: https://github.com/eorland//VIIRS-cubed.git
+repo_url: https://github.com/eorland/VIIRS-cubed.git
 repo_branch: main
 run_command: VIIRS-cubed/MAAP_DPS/run_viirs_batch.sh
 build_command: VIIRS-cubed/MAAP_DPS/build-env.sh
@@ -13,51 +13,46 @@ container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base
 queue: maap-dps-worker-32gb
 
 inputs:
-  - name: output_dir
-    type: positional
-    description: >
-      Base output directory for all fire outputs. Must be an S3 URI
-      or local path. Outputs are written to
-      {output_dir}/{fire_name}_Gridded_VIIRS/Data/Step1_Compiled_Swaths/
-    default: s3://maap-ops-workspace/shared/gsfc_landslides/L1_VIIRS_Swath_Outputs
-    required: true
+  positional:
+    - name: output_dir
+      description: >
+        Base output directory for all fire outputs. Must be an S3 URI
+        or local path. Outputs are written to
+        {output_dir}/{fire_name}_Gridded_VIIRS/Data/Step1_Compiled_Swaths/
+      default: s3://maap-ops-workspace/shared/gsfc_landslides/L1_VIIRS_Swath_Outputs
+      required: true
 
-  - name: sensors
-    type: positional
-    description: >
-      JSON list of VIIRS sensors to include.
-      Options: "SNPP", "NOAA20", "NOAA21"
-    default: '["SNPP", "NOAA20", "NOAA21"]'
-    required: true
+    - name: sensors
+      description: >
+        JSON list of VIIRS sensors to include.
+        Options: "SNPP", "NOAA20", "NOAA21"
+      default: '["SNPP", "NOAA20", "NOAA21"]'
+      required: true
 
-  - name: overwrite
-    type: positional
-    description: >
-      Rerun fires where has_run=True and overwrite existing Step 1 files.
-      Accepts "true" or "false".
-    default: "false"
-    required: false
+    - name: overwrite
+      description: >
+        Rerun fires where has_run=True and overwrite existing Step 1 files.
+        Accepts "true" or "false".
+      default: "false"
+      required: false
 
-  - name: n_timesteps
-    type: positional
-    description: >
-      Maximum number of timesteps to process per fire. 
-      -1 processes all available timesteps.
-    default: "-1"
-    required: false
+    - name: n_timesteps
+      description: >
+        Maximum number of timesteps to process per fire.
+        -1 processes all available timesteps.
+      default: "-1"
+      required: false
 
-  - name: make_plots
-    type: positional
-    description: >
-      Generate and save overview plots for each swath to S3.
-      Accepts "true" or "false".
-    default: "false"
-    required: false
+    - name: make_plots
+      description: >
+        Generate and save overview plots for each swath to S3.
+        Accepts "true" or "false".
+      default: "false"
+      required: false
 
-  - name: no_spatial_test
-    type: positional
-    description: >
-      Skip spatial alignment verification for each swath.
-      Accepts "true" or "false".
-    default: "false"
-    required: false
+    - name: no_spatial_test
+      description: >
+        Skip spatial alignment verification for each swath.
+        Accepts "true" or "false".
+      default: "false"
+      required: false
