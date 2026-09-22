@@ -9,7 +9,7 @@ repo_branch: main
 run_command: VIIRS-cubed/MAAP_DPS/run_viirs_batch.sh
 build_command: VIIRS-cubed/MAAP_DPS/build-env.sh
 disk_space: 32GB
-container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v4.2.0
+docker_container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v4.2.0
 queue: maap-dps-worker-32gb
 
 inputs:
