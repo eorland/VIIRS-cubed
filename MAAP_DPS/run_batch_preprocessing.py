@@ -37,8 +37,13 @@ import traceback
 import pandas as pd
 import geopandas as gpd
 import s3fs
+import sys
 
+# Ensure repo root is on path so sibling modules resolve correctly
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from swath_preprocessing import process_swaths
+
+
 
 # ===========================================================================
 # CONSTANTS
